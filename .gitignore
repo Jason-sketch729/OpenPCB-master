@@ -1,0 +1,83 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+*.tsbuildinfo
+target/
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+scripts/.dist
+.env
+.env.local
+.env.e2e
+
+# Desktop packaging outputs
+bin/
+dist-electron/
+electron/out/
+
+# CoreLibrary artifacts are populated at build time by scripts/fetch-core-library.ts
+# or the release.yml CI workflow. Never commit binaries here.
+resources/core-library/*.opclib
+resources/core-library/SHA256SUMS
+.build/
+
+# Development databases (default OPENPCB_DB_PATH = dev-data/openpcb.sqlite)
+dev-data/
+src/core/backend/dev-data/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.data
+.sisyphus/
+
+# Claude Code / agent scratch outside repo source
+.claude/plans/
+.claude/skills/*
+!.claude/skills/pcb-hardening-review/
+.claude/scheduled_tasks.lock
+
+# Local Playwright artifacts
+.playwright-mcp/
+.playwright-cli/
+test-results/
+test-*.png
+wizard-*.png
+verify-*.png
+
+# Raw KiCad footprint download dumps (curated subset is committed under
+# src/modules/library/backend/builtins/kicad-assets/)
+data/footprints/kicad-footprints-master-*.pretty/
+data/footprints/kicad-footprints-master-*.zip
+
+# graphify knowledge-graph output (generated)
+graphify-out/
+
+# Subagent scratch memory (session-local)
+.claude/agent-memory/
+src/core/backend/.claude/
+
+# Local QA run archives (screenshots, DB snapshots, findings) — backed up manually, never committed
+/docs/qa/2026-09-ui-qa/raw-run/
+/docs/qa/2026-09-ui-qa/evidence/
+
+# Runtime footprint model store written by a backend run from src/core/backend (dev/e2e)
+src/core/backend/models/

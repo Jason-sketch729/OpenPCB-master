@@ -1,0 +1,324 @@
+# 06 — Batch DRC reference-implementation contract (Session 7)
+
+Status: **S7 complete (2026-09-09)** — implemented; one Astra adversarial-verify run and two review
+passes folded (§11); golden delta in §10; gates at close in `PROGRAM.md`.
+
+This contract states what batch DRC is: the reference legality implementation of OpenPCB. It
+fixes which inputs the engine trusts and which it derives, the item model every check reads, the
+complete inventory of checks and pair kinds with the kernels and comparison regimes they use,
+the shape of the report, and the limits that remain. Live DRC converged on it in S8
+(`07-live-parity-contract.md`: `checkPendingCopper` runs these checks' subject-set forms —
+`judgeCopperPairs`, `copperToHolePairs`, `boardItems` / `holePairs`, `keepoutItems` and the per-item
+scalars — through the same `finalizeReport`; the batch loops are unchanged and the clearance codes'
+emit site is `checks/clearance-judge.ts`); S9 moved candidate discovery into two indexes with the
+pre-S9 enumerations kept as the oracle (`08-broad-phase-contract.md`: byte-identical reports in both
+modes); execution (S10) still converges on it;
+S11–S14 extend it. Session sequence and gates: `PROGRAM.md`.
+
+## 0. Scope
+
+In scope: `src/shared/drc/` — relocated there in S8 from `src/modules/designer/backend/drc/`, which is now re-export shims — (`drc-engine.ts`, `drc-context.ts`, `pair-gap.ts`,
+`code-registry.ts`, `severity.ts`, `violation-id.ts`, `checks/*`), the shared derivations it
+consumes (`src/shared/pcb-connectivity/copper-records.ts`, `src/shared/rendering/pcb/pcb-drills.ts`,
+`src/shared/rendering/pad-copper-layers.ts`, `src/shared/drc/`, `src/shared/pcb-geometry/`,
+`src/shared/pcb-areas/`, `src/shared/rendering/copper-fill/`), and the consumers of the report.
+
+Out of scope, with the owning session: live / route parity (S8, `07-live-parity-contract.md`), the broad phase (S9, `08-broad-phase-contract.md`), async
+execution (S10, contract 09), slot / annular / aspect / plating models (S11, contract 10; scoped hole rules stay open), DFM
+overlays and copper-shape checks (S12, contract 11), exact-arc geometry (S12b, contract 12) and polygon pads (S12c),
+SI and length semantics (S14). Electrical thresholds joined the engine's own rule model in S13
+(`13-electrical-contract.md`): the IPC-2221 spacing is a constituent of every pair verdict and
+unassigned copper resolves on its tier net.
+
+## 1. The reference-implementation statement
+
+`runDrc(projection, options)` is a pure function. It **trusts** exactly three things from the
+projection: the board settings (`board`, incl. rules, classes, assignments, view-state
+suppressions), the schematic pad→net correlation (`padNets`) and the net-name map (`netNames`).
+It **derives everything else itself**, through the one shared derivation each physical question
+has, and never reads a caller-computed answer:
+
+| Question | Derivation (the only one) | Where it is consumed |
+|---|---|---|
+| Which copper exists, on which layers | `buildCopperRecords` (S1) — pads incl. free pads via `freePadCopperLayers`, traces, vias | every item in §2 |
+| Which drills exist | `freePadDrill` + free holes + via / footprint drills (`pcb-drills.ts`) | `DrcHole` list |
+| The board region | `buildBoardRegion` (S2, biased `board-inner`) | edge, off-board, hole checks, outline validity |
+| Effective copper areas and keepouts | `collectCopperZones` / `collectKeepouts` (S3a) | zones, keepouts, pours |
+| Every rule value | `createRuleResolver` (S6) | every clearance / scalar comparison |
+| Electrical connectivity | `computeBoardConnectivity` over the context's own records and pours (S1/S5) | dangling, dead copper, **ratsnest** |
+| The ratsnest | `ratsnestFromConnectivity` over that connectivity (S7) | `UNCONNECTED_NET` |
+| Pour copper | `buildCopperFillIslands` once per effective zone (S5) | connectivity pour nodes, pour verdicts |
+
+Before S7 the engine read `projection.ratsnest`, a loader-computed field; a projection whose
+ratsnest and copper disagreed could produce a report contradicting its own connectivity. The
+loader still computes a ratsnest for the canvas; a parity test asserts it equals the engine's on
+every golden.
+
+The engine has no `Date`, no `Math.random`, no I/O. Two runs over equal projections produce
+byte-identical reports (§7).
+
+## 2. Item model
+
+`buildDrcContext` turns the projection into millimetre-domain items once; checks read items,
+never the projection's primitives (the two exceptions are placements for `PLACED_PART_MISSING_FOOTPRINT`
+and the outline for milling advisories, both non-copper).
+
+| Item | Built from | Geometry | Layer policy |
+|---|---|---|---|
+| `DrcTrace` | every trace record | round-capped polyline stadium (`pointsMm`, `halfWidthMm`), AABB inflated by the half width | its declared layer, **un-clamped** — an off-stackup layer raises `TRACE_LAYER_MISMATCH`, which is non-overridable and non-waivable (S7): the copper collides with nothing, so the code is its only guard |
+| `DrcPad` | every pad record: footprint pads and free pads (`smd` / `conn` on their declared layer, `std` on every copper layer, `hole` has no copper) | world ring (rotated, mirrored); **`disc`** for a true circle (S7 — the exact disc, not the circumscribed 48-gon); `custom` / `trapezoid` = bounding rectangle (declared superset, S11) | resolved layers; an off-stackup declaration → **clamp** to every valid layer (cannot mask a short) + `PAD_LAYER_MISMATCH` |
+| `DrcViaGeom` | every via | disc of `diameterMm / 2` | its span; an invalid span → clamp to every valid layer + `VIA_LAYER_SPAN` |
+| `DrcHole` | via barrels (`via`), footprint pads with a drill (`pth`, or `npth` when `plated: false` — S11), **every free pad with a drill** (`pth` iff `std`, else `npth` — S7), free holes (`npth`); since S11 derived from the DRILLED OBJECTS (`footprintPadDrill` / `freePadDrill`), never from the copper records, so a copper-less NPTH pad is still a hole | disc of `drillMm / 2` (the tool = the slot width), or the slot stadium (`slot`) for oblong drills — footprint slots and drill offsets included since S11; `annularRingMm` = the exact copper width around the wall (contract 10 §3) | through every layer |
+
+Connectivity items are built from the same records under the **fail-safe** policy (an invalid
+pad or via occupies no layer); the two policies share one geometry (S1 §2).
+
+Single-point traces cannot reach the engine (`pcb-store.ts` rejects `< 2` points and non-finite
+coordinates); the disc branches that handle them in `checks/board.ts` are defensive.
+
+## 3. Check inventory
+
+Twenty-one checks run in this order (four DFM checks joined in S12, contract 11); the report order is canonical (§6), so the order matters
+only for the memoised context (rules and areas first because they contextualise what follows).
+
+| Check | Codes | Items | Kernels | Regime (§5) |
+|---|---|---|---|---|
+| `rules` | `DRC_RULE_INVALID`, `DRC_RULE_INEFFECTIVE` | resolver problems | — | — |
+| `outline` | `BOARD_OUTLINE_INVALID` | region rings | `ringSelfIntersects`, `ringStrictlyInside`, `ringsIntersect`, `ringSignedArea` | degenerate area `DEGENERATE_AREA_MM2` |
+| `zones` | `ZONE_INVALID`, `ZONE_EMPTY_FILL` (net reasons), `ZONE_OVERLAP` | effective zones / keepouts + derivation warnings | `ringsOverlapPositiveArea` | inclusive overlap |
+| `constraints` | `TRACE_LAYER_MISMATCH`, `PAD_LAYER_MISMATCH`, `VIA_LAYER_SPAN` | traces, pads, vias | — | — |
+| `structural` | `PLACED_PART_MISSING_FOOTPRINT` | placements | — | — |
+| `manufacturability` | `TRACE_WIDTH_MIN`, `VIA_DIAMETER_MIN`, `VIA_DRILL_MIN`, `ANNULAR_RING_MIN`, `DRILL_SIZE_MIN`, `VIA_ASPECT_RATIO`, `FAB_TRACE_WIDTH`, `FAB_DRILL`, `FAB_PAD`, `FAB_ANNULAR_RING`, `OUTLINE_INTERNAL_RADIUS`, `OUTLINE_SLOT_WIDTH` | traces, vias, holes, outline **and cutouts** (S7) | resolver scalars; `findSmallInternalRadii`, `findNarrowestSlot` | minimums `below`; fab `below`; aspect `exceeds` |
+| `netclass` | `NETCLASS_TRACE_WIDTH`, `NETCLASS_VIA_DIAMETER`, `NETCLASS_VIA_DRILL` | traces, vias (intent-gated nets) | resolver class | minimums |
+| `clearance` | six `*_CLEARANCE`, `NET_SHORT_CIRCUIT`, `FAB_CLEARANCE` | traces, pads, vias — every different-net pair on a shared layer | `pair-gap.ts` (S2 kernels), resolver `clearance` / `clearanceBound`, `splitSegmentAtRings` | short inclusive; clearance `clearanceViolated`; fab `below` |
+| `copper-to-hole` (S7) | `COPPER_TO_HOLE` | traces, pads, vias × non-plated holes | `pair-gap.ts` `copperHoleGap`, `copperToHoleClearanceMm` | clearance |
+| `connectivity` | `UNCONNECTED_NET` | the engine's own ratsnest (§1) | `ratsnestFromConnectivity` | — |
+| `copper-pour` | `ZONE_FILL_FAILED`, `ZONE_EMPTY_FILL` (no island), `ISOLATED_COPPER_ISLAND` | pour results, connectivity components | S5 kernel | — |
+| `dangling` | `TRACK_DANGLING`, `VIA_DANGLING` | connectivity contact records | S1 kernel | — |
+| `electrical` | `TRACE_CURRENT_WIDTH` (per trace, tier net's class current, inner / outer copper weight — 13 §5) | traces | `ipc2221-spacing.ts` | minimums |
+| `clearance` (S13 constituent) | `CREEPAGE_DISTANCE` — the IPC-2221 spacing constituent of every pair verdict, its own row beside the ordinary row (13 §3.3); pads of one footprint get the voltage constituent only | the six pair kinds | `rule-resolver.ts` voltage term, `pair-gap.ts` | clearance |
+| `signal-integrity` | `DIFF_PAIR_GAP`, `DIFF_PAIR_SKEW`, `DIFF_PAIR_UNCOUPLED_LENGTH`, `NET_LENGTH_UNDEFINED` | the members' PATHS (`ctx.netPaths()`, contract 14 §2) against the partner's copper traces | `drc/si/coupled-span.ts` (closed-form sublevel intervals, contract 14 §4) | `below()` at `DRC_EPS_MM` (14 §4.2; amended 2026-09-13, was "bare") |
+| `length` | `NET_LENGTH_OUT_OF_RANGE`, `NET_LENGTH_UNDEFINED` | the net's PATH per group (anchor `net` + `lengthGroup`, S7) | `ctx.netPaths()` — the minimal terminal-spanning subtree (contract 14 §2–§3) | `below()` at `DRC_EPS_MM` (14 §4.2) |
+| `board` | `COPPER_TO_BOARD_EDGE`, `COPPER_OFF_BOARD`, `HOLE_TO_BOARD_EDGE`, `HOLE_OFF_BOARD`, `HOLE_TO_HOLE`, `FAB_HOLE_TO_HOLE` | traces, pads (disc-aware), vias, holes vs the biased region | region kernels, resolver `edgeClearance` / `holeToHole` | clearance for copper edge; minimums for holes |
+| `keepouts` | `KEEPOUT_VIOLATION` | traces, vias, pads (disc-aware), placement extents | `keepoutAffects` (S3a) | open interior |
+| `courtyard` (S12) | `COURTYARD_OVERLAP`, `COURTYARD_INVALID` | per-side courtyard regions (`ctx.placementCourtyard`) | `courtyard-rings.ts`, kernel `intersection` (11 §2) | positive area |
+| `silkscreen` (S12) | `SILK_TO_MASK_CLEARANCE`, `SILK_TO_BOARD_EDGE`, `FAB_SILK_CLEARANCE`, `FAB_SILK_WIDTH`, `FAB_SILK_TEXT_HEIGHT` | the silk artwork × mask openings, board region | `filled-gap.ts` signed gap (11 §3) | clearance / minimums |
+| `solder-mask` (S12) | `MASK_BRIDGE`, `FAB_MASK_BRIDGE`, `MASK_SLIVER`, `FAB_MASK_TO_COPPER` | mask openings × openings / copper incl. pour islands | `filled-gap.ts` (11 §4) | minimums |
+| `copper-shape` (S12, batch-only) | `COPPER_CONNECTION_WIDTH`, `COPPER_SLIVER`, `COPPER_SHAPE_UNCHECKED`, `TRACE_ACUTE_ANGLE`, `TRACE_OVERLAP` | per-(layer, net) copper unions, pour islands, trace segments | `copper-shape-kernel.ts` erosion + bisection (11 §5) | verdict band `(w − 3e-3, w)`; angular `ANGLE_EPS_DEG` |
+
+Every code has exactly one class (`RULE_CLASS_BY_CODE`), one default severity
+(`DEFAULT_SEVERITY_BY_CODE`), one label (`CODE_LABEL`) and at least one registered emitter
+(`EMIT_SITE_BY_CODE`) — all four are `Record<DrcRuleCode, …>`, so an unmapped code fails `tsc`.
+Checks emit facts (code, anchors, measured, required, location, layer); the engine assigns class
+and severity. The census test (§6) proves reachability: the corpus provokes every code.
+
+## 4. Pair-kind matrix
+
+Rows and columns are physical things on the board; each cell names the check that judges the
+pair, or the reason no check does.
+
+| | trace | pad | via | NPTH drill | board edge / cutout | keepout | zone (other net) | pour copper |
+|---|---|---|---|---|---|---|---|---|
+| **trace** | clearance (`traceToTrace`) | clearance (`traceToPad`) | clearance (`traceToVia`) | copper-to-hole | board (`edgeClearance`, off-board) | keepouts | pour carves around it (S5) | by construction |
+| **pad** | · | clearance (`padToPad`; same-footprint pairs: short tier only) | clearance (`padToVia`) | copper-to-hole | board | keepouts | carve | by construction |
+| **via** | · | · | clearance (`viaToVia`) | copper-to-hole | board | keepouts | carve | by construction |
+| **NPTH drill** | · | · | · | board (`HOLE_TO_HOLE`) | board (`HOLE_TO_BOARD_EDGE` / `HOLE_OFF_BOARD`) | not a copper item — no restriction applies | pour clears it by `copperToHoleClearanceMm` | — |
+| **PTH / via drill** | covered by the copper pair | · | · | board (`HOLE_TO_HOLE`) | board | · | · | — |
+| **zone** | · | · | · | · | `ZONE_INVALID` off-board | `copperPour` restriction (subtracted) | `ZONE_OVERLAP` (equal priority) | — |
+| **null-net copper** | pairwise: clearance tier (a null net matches no scope); **a null-net item touching two known nets is a short** (S7) | | | | | | | |
+
+"By construction": pour copper is generated with the resolver's clearance halos and is never
+re-measured against foreign copper; a kernel regression would produce a clean report. The pour
+suite owns that assertion (filed S5).
+
+Copper-to-hole (S7): `required = clearance.copperToHoleMm ?? copperToBoardEdgeMm` — the
+non-plated wall is a bare substrate edge, which is exactly the value the fill has always applied
+to its NPTH halo, so DRC and the pour agree by construction and an absent field changes nothing
+in the artwork. A copper item's own drill is not a pair (anchor identity). Plated drills are
+covered by their copper. No scoped rule reaches the value (S11 adds hole pair kinds).
+Non-plated FOOTPRINT pads are seen since S11 (contract 10 §2): a `plated: false` pad (KiCad
+`np_thru_hole`, or a legacy row whose stored raw pad type says so) is an `npth` hole and a
+`COPPER_TO_HOLE` obstacle, and its copper — if any survives the drill — is a mechanical ring.
+
+Intra-footprint pads (S7): pads of one placement skip the clearance and fab tiers (spacing inside
+a footprint is the library's responsibility) but never the short tier — overlapping different-net
+pads of one footprint are a dead short on the board. Symmetric with the hole↔hole rule, which
+keeps overlapping drills of one footprint. Exception (R1 #4): a pair in which either pad is a
+`custom` / `trapezoid` bounding rectangle (`exactShape === false`) is not judged at all inside a
+footprint — its ring is a declared superset, and a short is non-waivable, so the pre-S7 skip
+stays (trapezoid / custom outlines are S12c — the importer degrades them to rectangles at the source, contract 10 §0). Across footprints such pads keep today's (conservative)
+verdicts.
+
+Null-net bridges (S7): the clearance loops record, for every null-net item, each known net whose
+copper it touches (`gap ≤ SHORT_EPS_MM`, shared layer). An item touching two or more distinct
+known nets emits `NET_SHORT_CIRCUIT` anchored on the item and the nets. Pairwise semantics stay
+S1's: unassigned copper touching one net is an extension of it. Chains through two null-net items
+were a stated limit until S13: the effective-net components (13 §4) report a conflict component
+whose direct bridge drafts do not name every label as one additional `NET_SHORT_CIRCUIT`.
+
+Touching unassigned copper is one conductor (S8 correction, `07-live-parity-contract.md` §4):
+until S8 the clearance tier still judged a touching (null, null) pair and a touching (null, named)
+pair as different nets and reported a negative-gap `*_CLEARANCE` — a conductor violating clearance
+with itself, or with the net it extends. Since S8 `emit` returns before the clearance and fab tiers
+for any touching pair with a null side (the bridge record of a (null, named) touch is kept); a
+null-net item that is merely close (`0 < gap < required`) to any copper is still judged, since it
+may be a different conductor. The `census` golden carried such rows; §10 records the delta. Since S13
+(B7-1 closed, `13-electrical-contract.md` §4) the unassigned copper also TAKES the rule tier of
+the net it extends: its pairs with other nets resolve as that net's, in batch and at the live
+gate alike.
+
+## 5. Comparison regimes
+
+| Regime | Form | Used by |
+|---|---|---|
+| Minimums | `below(v, limit)` = `v < limit − 1e-6` | manufacturability, net-class, hole↔hole, hole↔edge, current width, creepage |
+| Clearance | `clearanceViolated(gap, req)` = `gap < req − GEOM_EPS_MM` (0.5 nm) | six copper pairs, copper↔edge, copper↔hole |
+| Short | `gap <= SHORT_EPS_MM` (1e-4), inclusive | short tier, null-net bridges |
+| Fab | `below(gap, fabMin)` | `FAB_CLEARANCE`, `FAB_HOLE_TO_HOLE`, the fab validators |
+| Bare | `>` / `<` with no grace | — (SI and length moved to `below()` at `DRC_EPS_MM` in S14, contract 14 §4.2) |
+
+(`OPEN_FINDINGS.md` §5.1 listed the FAB tier under the clearance regime; the code uses `below`,
+and this table is now the record.)
+
+Every remaining approximation IN A DRC CHECK biases towards false-fail: bounding rectangles for
+`custom` / `trapezoid` pads, the board-inner biased region (≤ `MAX_CHORD_DEVIATION_MM` = 0.01 mm on
+curved edges — resolved in S12b by the certified interval, contract 12 §4), the pour's circumscribed arc samplers. The one
+approximation that biased the OTHER way — connectivity's circumscribed oval / roundrect ring
+fabricating contact across ≈ 2 µm (Astra S7 #5) — is CLOSED since S12b: every pad gap and touch
+is measured on the exact convex-core ⊕ disc shape (contract 12 §1). The AABB
+prefilter uses `clearanceBound` (board pair ∨ both classes ∨ rule maximum ∨ floor) ∨ `fabMin` ∨
+`SHORT_EPS_MM` over outward-inflated boxes — an upper bound of every value a pair can resolve to,
+so it cannot skip a violating pair.
+
+## 6. Report contract
+
+- `violations` is sorted by `(code, id)`; `countsByCode` keys follow that order; `summary` counts
+  non-waived violations. Input order cannot change the report.
+- Ids are unique within a report. Every code that can fire more than once between the same
+  anchors carries a location bucket (`LOCATION_HASHED_CODES`, now including the outline-milling
+  advisories); `NET_LENGTH_OUT_OF_RANGE` carries the group as a second anchor. The several copper
+  shapes of ONE pad number share a logical anchor (records carry `occurrence`, anchors do not), so
+  drafts that hash alike are collapsed by the engine to the worst witness (smallest `measuredMm`)
+  — one pin against one hole is one violation — and the hole↔hole loop never pairs a pin's own
+  drills (R1 #2).
+- Class and severity come from the tables; `override → matched rule → default`; the
+  non-overridable set is `NET_SHORT_CIRCUIT`, `VIA_LAYER_SPAN`, `PAD_LAYER_MISMATCH`,
+  `TRACE_LAYER_MISMATCH` (S7), `BOARD_OUTLINE_INVALID`, `ZONE_INVALID`, `ZONE_FILL_FAILED`,
+  `DRC_RULE_INVALID`.
+- Rule-class ignores persist for every class (`DRC_RULE_CLASSES` is derived from the union; the
+  store used to drop `dfm`, `electrical` and `signal-integrity` silently).
+- `measuredMm` is signed for `COPPER_TO_BOARD_EDGE`: negative when the copper is not inside the
+  region (S7); for a polygon pad that crosses the edge the magnitude is how far its ring reaches
+  past the boundary (never less than `GEOM_EPS_MM`, so it never serialises as `0`);
+  `COPPER_OFF_BOARD` stays the authoritative verdict.
+- The census gate: the corpus (five goldens + `golden-census-2l`) provokes every code; each
+  emitted code's class equals the table; ids are unique per fixture; the registry, severity, class
+  and label maps agree member for member.
+
+## 7. Determinism
+
+Reversing any input array (`traces`, `vias`, `placements`, `freePads`, `freeHoles`, `zones`,
+`keepouts`, `drcRules`) yields a byte-identical `JSON.stringify(report)`: every pairwise
+computation runs in the canonical orientation (the item with the smaller sorted anchor key leads),
+every per-net accumulation and "first trace" witness walks the traces in canonical id order
+(`canonicalTraces` — float sums are not associative, Astra S7 #6), so witnesses, locations and
+measured values do not depend on iteration order, and the canonical sort removes the last order
+dependence. S9 closed the one pair check that had no canonical orientation: `COPPER_TO_HOLE`
+now leads with the smaller anchor key too (two coincident drilled free pads tied on every survivor
+field and reported `anchors` in visit order — `08-broad-phase-contract.md` §9). One deliberate exception: the ORDER of `drcRules` is part of their meaning — two
+enabled rules of equal priority resolve by array index (rule-semantics contract §2 / §4.1), so
+reversing a table that contains such a tie is a different rule table, not a presentation change
+(Astra S7 #7). The caveat in `OPEN_FINDINGS.md` §5.2 is retired.
+
+## 8. Consumers
+
+`routes.ts` (`/drc/run` and the three cloud / auto-layout apply paths), `sdk.ts` (assistant
+`run_drc`, MCP resource, proposal apply), `scripts/drc-parity-harness.ts`,
+`scripts/update-drc-goldens.ts`, the golden and census tests. All call `runDrc` with options that
+default from the projection (05 §8); none re-orders or re-derives.
+
+## 9. Stated limits
+
+- `drillSizeMm`, the pad annular ring and `holeToBoardEdgeMm` read the board minimums directly —
+  no scalar kind exists, so no scoped rule can reach them (contract 10 §0 keeps this open).
+- `custom` / `trapezoid` pads are bounding rectangles in every consumer (the importer degrades
+  them to `rect` at the source; S12c) — excluded from the intra-footprint short tier (§4).
+  Footprint slots, drill offsets and the plating attribute are modelled since S11 (contract 10).
+- A slotted free-pad drill's two widths (`drillMm` and `drillSlot.widthMm`) are one value since
+  S11: the store hydrator enforces `drillMm === drillSlot.widthMm` (contract 10 §1.2).
+- A drilled `smd` / `conn` free pad opens its pad shape on its declared face and, since S12, the
+  drill relief on the far face (`11-dfm-contract.md` §1.3); a `hole` free pad opens both faces.
+- The Gerber writer flashes every pad (copper, mask, paste) from the S1 copper RECORDS since S11
+  (contract 10 §6): a non-orthogonal composed rotation becomes a rotated aperture macro, an
+  unequal `circle` is a disc of `widthMm` everywhere (10 §7), and a per-layer parity harness
+  (`gerber-pad-parity.test.ts`) holds the artwork to the record ring within 2e-6 mm on every
+  golden — B6-1 closed.
+- Two problems that hash to one id collapse into one row (§6); the survivor is the most severe,
+  then the largest deficit against its own requirement (Astra S7 #4). Since S9 an UNMEASURED group
+  keeps the smaller marker (x, then y) alongside its merged messages — before, `...last` kept
+  whichever draft came first, so two copper shapes of one pin inside a keepout reported the marker
+  the footprint's pad order put first (Astra S9 A2 #2, `08-broad-phase-contract.md` §11).
+- Invalid-layer traces are not clamped (§2); the guard is non-waivable.
+- Pour copper is never re-measured against foreign copper (§4).
+- Chained null-net shorts (§4).
+- The exact-arc second chance inside the chord band — CLOSED in S12b (contract 12 §4: certified interval, exact on ambiguity).
+- Via barrel length: a through via traversed outer-to-outer contributes `boardThicknessMm`; any other barrel traversal is `NET_LENGTH_UNDEFINED(via)` (S14, contract 14 §2.5). SI and length comparisons use `below()` at `DRC_EPS_MM` (S14).
+- Outline-milling advisories are fab-advisory (`custom` fab: none). Cutouts are judged with the
+  material OUTSIDE the ring (sharp void corners, parametric holes narrower than the cutter); the
+  slot / neck search is side-agnostic, so a narrow material web between two lobes of one cutout
+  no longer reports `OUTLINE_SLOT_WIDTH` for material-side pairs (S12b): board-material webs are
+  `OUTLINE_MIN_WEB` (contract 12 §5, the `outline.minWebMm` rule), including a whole outer outline
+  narrower than the rule. The cutout message names the cutout's id; its
+  ordinal is positional.
+- Rendering / export changes riding on the one free-pad model (release notes): a `std` free pad
+  now draws and exports copper on inner layers of a 4+-layer board; a `hole` free pad draws and
+  exports no copper (its mask relief on both faces stays); a drilled `smd` / `conn` free pad is
+  both connectable copper and an NPTH obstacle in the cloud snapshot.
+
+## 10. Golden delta
+
+`small` / `areas` / `rules` byte-identical. `cutouts` +4: two `COPPER_TO_HOLE` (trace `t_cross`
+runs straight through the Ø1 mm free hole `hole_warn` and the 4×1 mm slot `hole_slot`, measured
+−1.000 mm) and two intra-footprint `NET_SHORT_CIRCUIT` (U1 pads 4/5 and 12/13 overlap by 0.05 mm at
+a corner — a fixture-footprint defect the old skip hid). `pours` +2: null-net bridges on J1 / J2 —
+1.27 mm-pitch headers drawn with Ø1.6 mm pads, whose unassigned pin 2 physically overlaps pins 1
+and 3 (`gnd` / `s3`, `gnd` / `s4`); the fixture's geometry, not a demonstration board. No id was
+removed or changed. New `golden-census-2l` (`jlcpcb_2l`, 84 violations, 38 codes); the six
+goldens together provoke every code except `ZONE_FILL_FAILED` (kernel bail only; pinned by
+`drc-copper-pour.test.ts`). Every expected file was regenerated so its `countsByCode` keys sit
+in the canonical code order (§6) — `areas` / `rules` / `small` changed in key order only, values
+identical to S6. Digests at close: `areas 99c49e…`, `census 7b3a5e…`, `cutouts 43fbd5…`,
+`pours ab2451…`, `rules ed0705…`, `small cd4b96…`.
+
+
+S8 (2026-09-09): the extension rule of §4 removed two `TRACE_TO_TRACE_CLEARANCE` rows from
+`golden-census-2l` (84 → 82; the bridge trace's overlaps with the runs it bridges; its short
+survives) — `07-live-parity-contract.md` §10. The other five goldens are byte-identical after S8's
+relocation and refactor.
+
+## 11. Astra ledger
+
+**Run 1 — adversarial-verify, `gpt-6-astra`, xhigh, repository-grounded (`-C OpenPCB`, read-only),
+2026-09-09 07:42, ≈ 40 min, 235 k tokens.** Packet: this contract + the diff summary + the census result
++ 11 questions. Astra ran the targeted S7 suites (113 passed) and its own boundary / slot / layer /
+invalid-ring / net-name / purity probes. Eight findings, every one traced against source before
+acting:
+
+| # | Finding | Severity (Astra) | Verdict | Where |
+|---|---|---|---|---|
+| 1 | Gerber flashes a pad from its own aperture model: non-orthogonal rotations ship un-rotated, an unequal `circle` uses `widthMm` — a DRC-clean board can export a short | blocker | **partially confirmed** (a probe shows the 90° case is correct — the orthogonal swap works; 45° is un-rotated). Export-side, not batch DRC: registered as **B6-1**, `drc-audit-b6.test.ts`, owner S11 | §9 |
+| 2 | Creepage skips a pair whenever the ordinary rule dominates, but the ordinary tier never runs inside a footprint — two pads of one footprint 100 V apart go unreported | blocker | **accepted, fixed** — the skip no longer applies to same-footprint pairs (pre-S7 miss, same mechanism) | `electrical.ts` |
+| 3 | R1 #2's same-anchor skip in the hole↔hole loop hides two DISTINCT overlapping drills of one pin that Excellon still emits | high | **accepted, fixed** — only a coincident (same) drill is skipped | `board.ts` |
+| 4 | The id dedupe keeps the smallest measured and can drop an error for a warning | high | **accepted, fixed** — survivor = most severe, then largest deficit, then smallest measured | `drc-engine.ts` |
+| 5 | Connectivity's circumscribed oval / roundrect rings fabricate contact across a 2 µm gap — a real open is hidden, and the "false-fail only" claim is wrong for connectivity | blocker | **accepted as the recorded S1/S2 limit** — §5 corrected (the claim holds for DRC checks, not for connectivity); exact arcs for non-circles stay S11 | §5, §9 |
+| 6 | Float sums in `length.ts` / `signal-integrity.ts` and the `pTraces[0]` marker follow `ctx.traces` order — reversal changes the id multiset | medium | **accepted, fixed** — `canonicalTraces` (id order) before every accumulation and witness | `pair-gap.ts`, `length.ts`, `signal-integrity.ts` |
+| 7 | Equal-priority rules resolve by array index, so reversing `drcRules` can change a verdict — contradicting §7 | medium | **accepted as a contract correction** — rule order IS meaning (05 §2 / §4.1); §7 now states the exception | §7 |
+| 8 | The milling classifier infers winding from the arc-endpoint polygon; a major arc reverses it and a material tip is reported as a void corner | medium | **accepted, fixed** — winding from the flattened contour | `outline-manufacturability.ts` |
+
+Tests: `drc-s7-review-fixes.test.ts` (Astra #2, #3, #4, #6, #8 plus the R1 fixes),
+`drc-audit-b6.test.ts` (B6-1, `test.todo`). Reviewer passes before Astra: R1 (reviewer-critical,
+12 findings — a byte-identity hole in the hole↔hole loop, id collisions from multi-shape pads, a
+`stdFreePadIds` regression this session introduced, the non-waivable false short on bounding-rect
+pads, footprint NPTH pads invisible, `-0` in the signed measure, a NaN drill guard, the slot
+width vs `drillMm` split, mask policy, `std` on inner layers, the golden delta record) and R2
+(reviewer, accept with three lows) — all fixed or recorded above and in §9.

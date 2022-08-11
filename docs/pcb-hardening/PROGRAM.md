@@ -1,0 +1,881 @@
+# PCB correctness-hardening program
+
+> Program tracker for making OpenPCB trustworthy on ordinary medium-complexity boards.
+> Established 2026-09-06 (Session 0). Supersedes the retired DRC P0–P12 sequence in `TODO.md` §5.
+> Companion documents: [`00-ground-truth.md`](00-ground-truth.md) (current-master inventory,
+> produced by Session 0) and [`../drc/OPEN_FINDINGS.md`](../drc/OPEN_FINDINGS.md) (the defect
+> register — one `test.todo` per open finding).
+
+## Target
+
+**One authoritative model of physical connectivity and legality, shared by DRC, pours,
+zones/keepouts and manual routing.** Electrical and signal-integrity checks are then hardened so
+that today's simpler checks do not create architectural dead ends for future high-speed work.
+
+This is a correctness-hardening program, not a feature roadmap. Router cleverness, cloud
+auto-layout, visual polish, richer tuning UX, impedance routing, field solving and advanced
+autorouting are deliberately postponed until the foundation below is complete.
+
+## Operating model
+
+- **One session, one objective.** Do not broaden scope into adjacent subsystems unless required to
+  prove or preserve the phase invariant. Do not opportunistically implement unrelated TODOs.
+- **Fable 5.1 is the engineer** (exploration, implementation, tests, refactoring, integration).
+  Implementation past the delegation break-even goes to Sonnet/Opus subagents per the
+  `fable-orchestrator` skill; Fable reviews every diff.
+- **GPT-6-Astra is the scarce correctness specialist**, reached only through
+  `/pcb-hardening-review` (packet-first, read-only Codex, attack-and-specify, never writes code).
+  Every Astra run needs explicit user approval; two-pass sessions need the user present at both
+  points. Claude verifies every Astra finding against source before acting.
+- **Ordinary software review** (architecture, plumbing, UI) uses the generic Codex review skills,
+  not Astra.
+- **Session lifecycle:** reconnaissance → written invariant/problem inventory → Astra attack when
+  designated → verify Astra → implement → tests → self-review → optional post-implementation Astra
+  → close only verified findings.
+- **Astra effort policy:** `high` for narrow bounded review; `xhigh` for geometry algorithms,
+  cross-subsystem connectivity, polygon booleans, routing kernels, electrical/SI; `max` only for
+  disputed or exceptionally hard problems, with separate approval.
+
+## Standing instruction for every session
+
+```text
+This session has exactly one PCB-hardening objective.
+
+Do not broaden scope into adjacent subsystems unless required to prove or preserve
+the phase invariant. Do not opportunistically implement unrelated TODOs.
+
+Before changing code:
+1. Read src/modules/designer/AGENTS.md and docs/pcb-hardening/00-ground-truth.md.
+2. Reconcile live source with docs/drc/OPEN_FINDINGS.md and the corresponding
+   drc-audit-b*.test.ts regressions.
+3. State the current invariant, known failures, affected consumers, and explicit
+   out-of-scope areas.
+4. Identify whether the pcb-hardening-review Astra skill is required by this phase.
+5. If required, prepare the minimal packet and invoke /pcb-hardening-review using
+   the program-designated mode/effort. Do not ask Astra to implement.
+6. Verify every Astra finding against current source before accepting it.
+
+During work:
+- Prefer fixing the authoritative shared model rather than patching consumers.
+- Breaking changes are acceptable when they improve long-term correctness.
+- Preserve determinism unless this phase explicitly changes its contract.
+- Do not invent electrical/manufacturing constants (use /eda-standards or source).
+- Add or activate regression coverage for every confirmed defect addressed.
+- Exclude `_to_delete/` and `electron/out/` from every grep — they are gitignored stale trees.
+
+Before declaring the phase complete:
+1. Run the relevant focused tests.
+2. Run the appropriate full backend/typecheck gates (see 00-ground-truth.md §0 for the
+   baseline; no new failures beyond it).
+3. Re-read the complete phase diff.
+4. Perform the designated Codex/Astra post-review if required.
+5. Classify every Astra finding as accepted/rejected/unresolved with evidence.
+6. Confirm every phase exit criterion individually.
+7. Update OPEN_FINDINGS only for defects proven closed by live regression tests.
+8. Update this file's status column and summarize remaining risks without beginning the next phase.
+```
+
+## Dependency order (enforced)
+
+```
+S0  Ground truth
+ └► S1  Connectivity truth
+      └► S2  Geometry truth
+           └► S3a Zone/keepout semantics + data model
+                ├► S3b Zone/keepout authoring tools
+                └► S4  Zone/keepout legality integration
+                     └► S5  Copper-pour truth
+                          └► S6  DRC rule semantics
+                               └► S7  Authoritative batch DRC
+                                    └► S8  Live DRC / route-legality parity
+                                         └► S9  DRC broad-phase scaling
+                                              └► S10 DRC execution responsiveness
+                                                   └► S11 Hole / pad / via manufacturability
+                                                        └► S12 DFM overlays
+                                                             └► S12b Exact arcs
+                                                                  └► S12c Polygon pads
+                                                                  └► S13 Electrical rules
+                                                                  └► S14 SI v1 correctness
+                                                                       └► S15 High-speed runway
+                                                                            └► S15b Board stack-up model
+                                                                                 └► S16 Base manual routing
+                                                                                      └► S17 Advanced routing
+                                                                                           └► S18 PCB trust gate
+```
+
+Do not, for example, improve diff-pair routing while SI's definition of coupled length is still
+questionable, or optimize ratsnest performance while layer connectivity is still wrong.
+
+## Sessions
+
+Status values: `pending` · `in progress` · `done` · `blocked`. Owned findings use the ids in
+`docs/drc/OPEN_FINDINGS.md`; `—` means the session owns no register entry.
+
+### Stage A — one physical truth model
+
+| # | Session | Objective | Owns | Astra | Status |
+|---|---|---|---|---|---|
+| S0 | Ground-truth reconciliation | Establish what is true on current master; inventory every defect, invariant, duplicate model, test contract and doc drift. No implementation. | B2-9 (closed), B5-LIVE-PADGEOMS (closed), B2-5 (narrowed), B5-LIVE-ROT-PAD (spec rewritten) | none | done 2026-09-06 |
+| S1 | Physical copper connectivity truth | One trustworthy answer to "which copper is electrically connected": traces, pads, free pads, vias, layer transitions, same-layer and trace-interior junctions, schematic–pad correlation, ratsnest, pour-established connectivity. | B3-1, B3-3, B3-4, B3-5, B3-6 | spec-attack xhigh · adversarial-verify xhigh | done 2026-09-06 (`01-connectivity-contract.md`) |
+| S2 | Core PCB geometry truth | Trustworthy geometric primitives: segment relations, polygon intersection/containment, pad outlines, board outline, cutouts, arcs, rotation, tolerance boundaries, distances. No spatial index. | B4-1, B4-2, B4-6, B4-7; cutout crossing-overlap (vertex-containment) follow-up | spec-attack xhigh · adversarial-verify xhigh | done 2026-09-07 (`02-geometry-contract.md`) |
+| S3a | Zone / keepout semantic contract + data model | What a zone or keepout means everywhere: ownership/net, layer scope, board/cutout relation, zone vs keepout, enabled/disabled, persistence, import, render, Gerber, DRC and routing visibility. Types + parser + KiCad import + consumer visibility. Astra spec-attack run 1 aborted (usage limit); run 2 packet-only produced 18 findings, ledger §10. | — (new work; started from a KiCad-import-only `PcbZone` and no keepout type) | brainstorm or spec-attack xhigh (one call) | done 2026-09-07 (`03-zone-keepout-contract.md`) |
+| S3b | Zone / keepout authoring tools | Zone drawing tool, keepout drawing tool, commands + `routes.ts` parsers, inspector UI, canvas rendering, storage migration of the fill toggle into board-zone rows. Consumes the S3a contract; introduces no new legality semantics. | — | none (reviewer-critical on the migration, reviewer on commands + UI; Codex review not run) | done 2026-09-07 (`03-zone-keepout-contract.md` §12) |
+| S4 | Zone / keepout legality integration | Every legality consumer (DRC, routing obstacles, copper fill, manufacturing output) interprets zones and keepouts identically. | — | adversarial-verify xhigh (late) — run 1 completed, 5 findings all accepted | done 2026-09-07 (`03-zone-keepout-contract.md` §13) |
+| S5 | Copper-pour correctness | Generated copper represents real, electrically meaningful copper: fill extent, obstacle clearances, board/cutout clipping, same-net interaction, thermals, island identification and anchoring, zone fills, render/export/fill consistency, determinism. Uses S1 connectivity, never a pour-local definition. | B3-9, B3-10 | spec-attack xhigh (run 1: 15 findings, 11 accepted) · adversarial-verify xhigh (run 2: 9 findings, 8 fixed, 1 limit) | done 2026-09-08 (`04-copper-pour-contract.md`) |
+
+### Stage B — make DRC authoritative
+
+| # | Session | Objective | Owns | Astra | Status |
+|---|---|---|---|---|---|
+| S6 | DRC rule semantics and scoped constraints | Complete, unambiguous rule resolution: board rules, net classes, scoped rules, precedence, relaxations, floors, pair kinds, layers, area scopes, severity, waivers, migrations. Every stored rule type has one documented resolution path; nothing appears supported while inert. | scalar scoped constraints not enforced; area-scope midpoint approximation; optional severity ignored; v1→v2 waiver migration | spec-attack xhigh (run 1: 15 findings, 14 accepted, 1 limit) | done 2026-09-08 (`05-rule-semantics-contract.md`) |
+| S7 | Authoritative batch DRC completeness | Audit every check against the hardened primitives: duplicated geometry/connectivity models, checks bypassing shared rule resolution, declared-but-unemitted codes, primitive types checks cannot see, unit inconsistencies, false-pass directions, ordering. Batch DRC becomes the reference implementation. | — | repository-grounded adversarial-verify xhigh (run 1: 8 findings — 5 fixed, 2 contract corrections, 1 registered B6-1) | done 2026-09-09 (`06-batch-drc-contract.md`) |
+| S8 | Live DRC and manual-route legality parity | A route legal interactively is legal when committed and batch-checked, and vice versa where practical. Engine relocation to `src/shared/drc/` behind shims so both paths share item builders and kernels. Decide whether route commit gets a server-side clearance gate. | B5-LIVE-ROT-PAD, B5-LIVE-TH-PAD-SIDE | spec-attack xhigh (run 1: 9 findings, 7 accepted, 1 recorded as a guarantee, 1 bound) · repository-grounded adversarial-verify xhigh (run 2: 7 findings — 6 fixed, 1 registered B7-1 → S13) | done 2026-09-09 (`07-live-parity-contract.md`) |
+| S9 | DRC broad-phase scaling and determinism | Faster candidate discovery without changing meaning; exhaustive mode retained as oracle; byte-identical reports. Target 10k primitives under ~300 ms. | — | spec-attack xhigh · adversarial-verify xhigh (user decision 2026-09-09: post run regardless) | done 2026-09-09 (`08-broad-phase-contract.md`) |
+| S10 | DRC execution responsiveness | Expensive DRC runs without blocking the app: lifecycle, cancellation, progress, concurrency, partial-result semantics, deterministic final output. | B5-SYNC | none (user decision 2026-09-09: program default — plan-critique + `reviewer-critical` + `reviewer`) | done 2026-09-10 (`09-execution-contract.md`) |
+
+### Stage C — manufacturing and electrical trust
+
+| # | Session | Objective | Owns | Astra | Status |
+|---|---|---|---|---|---|
+| S11 | Hole, pad and via manufacturability geometry | Drill geometry, slots, PTH/NPTH, annular geometry, via type/span, aspect semantics. DRC's model of manufactured holes matches export. | B2-5 (manufacturability half), B2-6, B2-7, B6-1 | spec-attack xhigh (run 1: 16 findings — 2 blockers accepted, 13 folded, 1 rejected) · repository-grounded adversarial-verify xhigh (run 2a cut by the usage limit, 3 folded from its trajectory; run 2b: 6 findings, all accepted) | done 2026-09-10 (`10-manufacturability-contract.md`) |
+| S12 | DFM overlays and production checks | Courtyard, silkscreen, mask bridges/slivers, copper slivers, acute angles — built at Gerber parity. | — (no overlay codes exist today) | spec-attack xhigh; post only for polygon-topology checks | done 2026-09-11 (`11-dfm-contract.md`) |
+| S12b | Exact-arc geometry | ONE exact model of every curved copper and board shape: rounded pads (convex core ⊕ disc) in clearance, connectivity, keepouts and board-edge checks (closes 06 §5 / Astra S7 #5); ONE canonical contour arc (start radius, end point projected) at write and read; the exact arc kernel; outline validity on the exact contour for DRC AND the editor gate (S2 #8); board-edge verdicts on a certified interval from two biased regions, exact only on ambiguity (the S7 second chance, made sound); board-material minimum web by erosion (`OUTLINE_MIN_WEB`, S2 #11); Gerber Profile true arcs. Contract `12-exact-geometry-contract.md`. | — | brainstorm xhigh (plan, run 0) · spec-attack xhigh (run 1: 18 findings, all accepted) · repo-grounded adversarial-verify xhigh (run 2: 4 executed counterexamples, all fixed) | done 2026-09-11 (`12-exact-geometry-contract.md`) |
+| S12c | Polygon pads (trapezoid / custom) | True outlines through `kicad-parsers` (`rect_delta`, `primitives`) → `rendering-core` `outlinesMm` (pad-local rings, copper = their union) → `kicad-import`; OpenPCB consumers (records `rings`, pair kernels min over rings, pour, copper-shape unit, annular SDF, mask artwork, Gerber `%AM` primitive 4 per ring, canvas / 3D); existing rows re-parsed from `raw.rawSource`; authored fixtures (none exist). Re-owned from S12b on 2026-09-11; needs the S11 tag follow-up + a third tag round. | — | spec-attack xhigh | pending |
+| S13 | Electrical-rule fidelity | Voltage difference, clearance/creepage semantics, external/internal assumptions, current vs width, layer-dependent assumptions, defaults, applicable pad/via/trace combinations, interaction with net classes and scoped rules. Precise modest claims over ambitious labels. | B7-1 (unassigned copper does not inherit the rule tier of the net it extends — S8 Astra run 2) | brainstorm xhigh (run 0, plan mode: 13 concerns, two design choices broken) · spec-attack xhigh (run 1: 13 findings, all accepted) · repository-grounded adversarial-verify xhigh (run 2: 4 executed counterexamples, all fixed) | done 2026-09-12 (`13-electrical-contract.md`) |
+| S14 | SI v1 mathematical correctness | Routed length, branches/stubs, disconnected fragments, via contribution, coupled-span accounting, overlapping segments, gap measurement, diverging gap, layer transitions, pair ordering, determinism. Every reported SI number has a precise definition. | B8-1..B8-7 (registered 2026-09-13: duplicate copper double-counted, one-point gap sampling, P/N-order dependence, stubs/fragments as length, vias invisible, two pair identities + bare `P/N`, six HUD copies) | spec-attack xhigh (run 1: 15 findings — 13 accepted, 1 bound, 0 rejected) · repository-grounded adversarial-verify xhigh (run 2: 8 executed findings, all accepted and fixed) | done 2026-09-13 (`14-si-contract.md`) |
+| S15 | High-speed architecture runway | Identify contracts/data representations that would block credible future SI (stackup geometry, dielectrics, per-layer copper, reference planes, propagation delay, via barrel path, impedance targets, return-path continuity). Produce a compatibility document; change only what prevents a known dead end. | S15-1 (settings erasure), S15-2 (6+-layer export) | brainstorm xhigh (run 0, plan mode: 7 questions — the draft's two "blocked" verdicts on `NetPath` overruled, the hybrid via length shown non-additive) | done 2026-09-18 (`15-high-speed-runway.md`) |
+| S15b | Board stack-up model | The persisted stack-up contract 15 §4 briefs: ordered per-gap dielectric sequences, nominal / plating / finished copper kept distinct, per-quantity validity, `boardThicknessMm` authoritative with SOURCED bounding surfaces, ONE additive axial via metric per declared board (undeclared boards keep 14 §2.5 verbatim), stub as a branch inventory, canonical-grid numerics + conditional digest entry, KiCad `(general (thickness))` / `(setup (stackup))` import, the literal `1.6`s, and a MINIMAL STACK-UP EDITOR (user decision 2026-09-18: included; S15b runs before S16). Source note: `sources/jlcpcb-stackup-2026-09-18.md` (nominal thickness = a label with ± 10 % / ± 0.1 mm tolerance, no stated bounding surfaces; declared per-layer copper overrides the weight conversion). Pays 14 §10's elevation IOU. | S15-6, S15-7, S15-8, S15-10 | spec-attack xhigh (+ post if the net-path kernel changes) | pending |
+
+### Stage D — routing after legality is trustworthy
+
+| # | Session | Objective | Owns | Astra | Status |
+|---|---|---|---|---|---|
+| S16 | Base manual-routing correctness | Manual 45/90 routing, finish behaviour, obstacle representation, walkaround, pull-tight, bounded auto-finish, deterministic geometry — as a consumer of the authoritative legality model. Failing to find a path is acceptable; accepting an illegal route is not. | — | adversarial-verify high/xhigh | pending |
+| S17 | Advanced routing: tune, bundle, diff-pair | Tuning, bundle offsets, diff pairs, lane relationships, length targets verified against connectivity, DRC, diff-pair semantics and SI v1. Consumes SI/DRC definitions; invents none. | — | spec-attack xhigh for algorithm changes; post if kernels change | pending |
+| S18 | PCB trust gate | Attempt to prove the hardened subsystems still disagree. Representative boards (2-layer and multilayer, SMD + PTH, free pads, slots, vias, cutouts, concave outlines, zones, keepouts, pours, islands, GND, high-current, higher-voltage, diff pairs, tuned routes, intentionally broken layouts) plus a realistic medium board, verified across schematic → connectivity → ratsnest → routing → live legality → batch DRC → pours → zones → DFM → electrical/SI → Gerber/Excellon. | — | repository-grounded adversarial-verify xhigh; `max` only on a disputed critical finding | pending |
+
+## Per-session exit gates
+
+- **S1** — pending regressions live; no net-name special case manufactures connectivity by
+  itself; free pads participate; layer changes require physically legitimate connections
+  (a via whose span covers both layers); results deterministic; ratsnest and `UNCONNECTED_NET`
+  agree; the six connectivity models in `00-ground-truth.md` §4 are reduced to one, or every
+  remaining consumer is proven equivalent. S1 consumes only `src/shared/pcb-geometry/` kernels
+  and lists which; it never inlines a predicate.
+- **S2** — higher-level code can ask intersects / contains / distance / off-board / inside-cutout
+  without a second approximation; arc flattening bias is explicit and safe per use; the
+  duplicate predicates in `00-ground-truth.md` §4 are unified or their divergence is documented as
+  intentional.
+- **S3a** — one written zone/keepout contract; nobody can ask "does this keepout affect this
+  object?" and get different answers from DRC, routing and rendering.
+- **S3b** — authoring tools produce only data the S3a contract defines; every command has its
+  `routes.ts` parser; no tool-local legality.
+- **S4** — zone/keepout behaviour coherent across DRC, routing obstacles, copper fill and
+  manufacturing output before pour hardening starts.
+- **S5** — a pour is called electrically connected only when the S1 model can justify it;
+  render, export and fill paths represent the same copper; `measuredMm` carries millimetres.
+- **S6** — every supported rule type has one documented resolution path; no stored rule is
+  silently inert; routing and live DRC consume the same resolver as batch DRC or the divergence
+  is an explicit, tested contract.
+- **S7** — batch DRC can be called the reference implementation; the emit census still shows
+  every declared code emitted and every emitted code declared.
+- **S8** — for equivalent geometry, live and batch agree on collision class, affected layer,
+  required rule, legal/illegal boundary and measurement (`|measured_live − measured_batch| ≤
+  1e-9`); the route-commit gate decision is recorded and implemented. *Met 2026-09-09: the live
+  path IS the batch pair kernel (`checkPendingCopper`), compared with `===` (the budget is
+  unused) on 192 leave-one-out items / 3 429 violations across the six goldens plus hand-built
+  fixtures for every pair kind; the server gate refuses the 07 §6 set unless `legality: "report" |
+  "off"`. Gates at close (after the Astra run-2 fixes): backend 2168 pass / 22 known library+assistant
+  fails / 8 skip / 6 todo (2204; the sixth todo is B7-1); tsc 44; Vitest 61 files 545 + 1 todo; gen +
+  gen:contracts clean; e2e zones + board-shape + routing + live-parity 15 passed + 1 flag-skip;
+  goldens byte-identical except the recorded census delta (84 → 82).*
+- **S9** — optimized and exhaustive modes agree byte-for-byte on representative medium boards;
+  ordering stable; no false negatives introduced. *Evidence at close (2026-09-09): the two-mode
+  oracle harness (`drc-broad-phase-oracle.test.ts`) asserts equal pre-finalise draft multisets AND
+  byte-identical reports on the six goldens, the determinism fixture with its eight reversals, an
+  18-board seeded corpus (300 / 1 500 / 5 000 items; every generator feature on ≥ 2 boards) and the
+  Astra / review micro-fixtures; a halved-halo mutation is caught at the gate and in every batch
+  check; the halo inequalities hold at every area centroid and item centre of the corpus; the
+  corpus's own code union (28) is a floor. Bench on this machine: 10k primitives `runDrc` 3.5 s →
+  196 ms (`checkClearance` 1 035 → 48 ms, `checkBoard` 2 130 → 26 ms), `buildDrcItems` 14 ms,
+  census 11 ms. Ordering: the six `.expected.json` shasums unchanged; the one pre-existing
+  canonicality hole (`COPPER_TO_HOLE` anchors in visit order) and the unmeasured-survivor marker
+  are canonical now. Gates: backend 2318 pass / 22 known library+assistant fails / 8 skip / 6
+  todo (2354); tsc 44; Vitest 61 files 545 + 1 todo; gen + gen:contracts clean; e2e routing +
+  live-parity 4 + 1 flag-skip.*
+- **S10** — expensive runs no longer block command dispatch or SSE; cancel leaves no partial
+  persistence; B5-SYNC regression live. *Confirmed 2026-09-10: the batch run executes on one
+  persistent `node:worker_threads` worker; `drc-worker-client.test.ts` proves ≥ 5 main-thread
+  timer ticks, a `GET /api/health` and two progress stages all land before a 10k-board run
+  resolves; `drc-audit-b5.test.ts` "B5-SYNC" is live (a held worker → a command dispatch
+  completes while the run reports `running`; the released run persists `runDrc`'s exact bytes;
+  a cancelled run persists nothing; the real worker leg completes with equal bytes);
+  `drc-run-service.test.ts` covers join / supersede / FIFO / deleted design / SSE. Byte identity:
+  goldens ×6, the determinism fixture, three corpus boards and an empty-`rawFootprints` fixture
+  (in-thread vs worker), plus the built Electron bundle on plain Node (`npm run
+  test:drc-worker-smoke`, now a CI step); the six golden shasums unchanged;
+  `git diff src/shared/drc/checks` empty. Numbers: worker overhead 78 ms at 10k (41 ms clone),
+  ≤ 1 ms on the goldens; spawn 12–23 ms, once per process. Gates: backend 2352 pass / 22 known
+  library+assistant fails / 8 skip / 5 todo (2387); tsc 44; Vitest 63 files 576 + 1 todo; gen +
+  gen:contracts clean (`gen:copilot-schemas:check` fails on the pre-existing missing
+  `@openpcb/contracts/schemas/copilot` dir); e2e routing + live-parity + DRC + zones 13 + 1
+  flag-skip.*
+- **S11** — DRC's representation of drilled and plated structures matches what export emits,
+  slots included. *Evidence (2026-09-10): one drill derivation per object (`footprintPadDrill` /
+  `freePadDrill`) feeds DRC, the live gate, route obstacles, the pour's NPTH halo, Excellon, the
+  snapshot and `collectDrills`; `gerber-pad-parity.test.ts` holds every layer file of all seven
+  goldens to the record geometry within 2e-6 mm (1:1 flashes, copper / mask / paste) and the
+  Excellon hit SET to `ctx.holes` (position, tool, plating, slot ends); the annular ring is the
+  exact signed-distance kernel pinned to 1e-9 against an exact-primitive oracle (490 cases) and to
+  < 1e-6 against R1's independent sampler; B2-5 / B2-6 / B2-7 / B6-1 live (`test.todo` census
+  5 → 1); new `golden-holes-4l` (91 primitives, 29 violations: copper-less NPTH, NPTH rings, slots,
+  offset drill, blind via, 16:1 via, mirrored rotated pads); `golden-census-2l` re-baselined for
+  two attributed fab rows, the other five byte-identical; the export refuses non-through vias
+  (422). Gates: backend 2446 pass / 22 known library+assistant fails / 8 skip / 1 todo (2477);
+  tsc 44; Vitest 63 files 576 + 1 todo; gen + gen:contracts clean; `test:drc-worker-smoke`
+  byte-identical; `package-lock.json` untouched (034652c3); e2e DRC + routing + live-parity 5 +
+  1 flag-skip; golden shasums areas 99c49eb3 · census 15debab1 (two attributed fab rows) ·
+  cutouts 43fbd513 · holes-4l a431a463 (new) · pours ab245110 · rules ed0705e8 · small cd4b962e.*
+- **S12** — DFM checks use the same physical geometry export uses.
+- **S12b** — every curved copper shape has one exact model shared by connectivity, DRC and the live
+  gate; the outline verdict, the editor's contour gate, the board-edge verdicts near arcs and the
+  Profile the fab receives are computed from the exact contour; no material web is judged on chords;
+  every verdict away from the certified band is byte-identical to S12 (met 2026-09-11).
+  *Met 2026-09-11 (`11-dfm-contract.md`): the silk strokes and mask openings the checks judge are
+  the writer's own model (`gerber-silk-parity.test.ts`, 1:1 per face on every golden); courtyard
+  regions, copper unions and pour islands are the S1/S5 geometry. Gates: backend 2634 pass / 22
+  known library+assistant fails / 8 skip / 1 todo (2665); tsc 44; Vitest 63 files 576 + 1 todo; gen
+  + gen:contracts clean; `test:drc-worker-smoke` byte-identical (87 violations); `package-lock.json`
+  untouched (034652c3); e2e DRC + routing + live-parity 5 + 1 flag-skip; golden shasums areas 99c49eb3 · census b735e86b · cutouts 43fbd513 · dfm 47573fd3 · holes c8ab6694 · pours ab245110 · rules ed0705e8 · small 95fbb3dc
+  (`dfm-2l` new; `census` / `holes` / `small` re-baselined with per-code attribution in their `.md`;
+  `areas` / `cutouts` / `pours` / `rules` byte-identical).*
+- **S13** — no check claims more than its model proves; every electrical constant is sourced (met
+  2026-09-12 — gate baseline recorded in the S13 decisions bullet below).
+- **S14** — every SI number has a precise mathematical definition and a testable interpretation.
+  *Met 2026-09-13 (`14-si-contract.md`): routed length = the minimal terminal-spanning subtree of
+  the bridge-only forest over the S1 junction graph (§2); coupled / tight / wide / uncoupled are
+  closed-form sublevel-interval measures over each member's path against the partner's copper
+  (§4), pinned by brute-force sampling oracles (segment-sublevel 500 cases, coupled-span 4
+  fixtures at 1e-4 mm, an independent 5e-4 oracle in R2: worst 3.96e-4) and by naive-all-pairs
+  equality of the sweep; B8-1..B8-7 flipped live; swap / reversal / shuffle / rigid-translation
+  byte identity; the six HUD copies and the second diff-pair identity gone. Gates at close:
+  backend 3033 pass / 22 known library+assistant fails / 8 skip / 0 todo (3063; a 26-fail run was
+  a load artefact — timeouts, clean on re-run); tsc 44; Vitest 66 files 594 + 1 todo; gen +
+  gen:contracts clean; worker smoke byte-identical (census 85); e2e DRC + routing + live-parity
+  5 + 1 skip; `package-lock.json` 034652c3; goldens arcs cd6b067e · areas 99c49eb3 · census
+  c02bd526 (re-fixtured, 87 → 85, attributed) · cutouts 43fbd513 · dfm 47573fd3 · electrical
+  a9990112 · holes c8ab6694 · pours ab245110 · rules ed0705e8 · si 0c45b4d6 (NEW, 104
+  primitives, 24 violations / 10 codes) · small 95fbb3dc (nine byte-identical to the S13
+  baseline).*
+- **S15** — a future-SI compatibility document exists; near-term changes only where they prevent
+  a known dead end. *Met 2026-09-18 (`15-high-speed-runway.md`): the capability ladder, the dead-end
+  register (one true blocker — settings erasure — fixed), eight binding extension rules and the
+  stack-up brief for S15b; evidence in the S15 decisions bullet below.*
+- **S15b** — a board with a valid declared stack-up has elevations and ONE additive via metric; a
+  board without one is byte-identical to S14; every stack quantity is declared or unknown, never
+  defaulted or invented; KiCad imports carry their thickness.
+- **S16** — the route tool reasons consistently and deterministically about any legal path it
+  represents.
+- **S17** — advanced routing consumes SI/DRC definitions rather than competing definitions of gap,
+  length or legality.
+- **S18** — the cross-subsystem disagreement hunt finds nothing, or every finding is filed with
+  an owner.
+
+## Astra allocation
+
+| Session | Astra use |
+|---|---|
+| S0 | none |
+| S1 | **xhigh pre + xhigh post** |
+| S2 | **xhigh pre + xhigh post** |
+| S3a | xhigh once (run 1 aborted on quota, run 2 completed) |
+| S3b | none |
+| S4 | xhigh post (run 1 completed; 5 findings accepted) |
+| S5 | **xhigh pre + xhigh post** |
+| S6 | high/xhigh once |
+| S7 | xhigh post (repository-grounded) |
+| S8 | **xhigh pre + xhigh post** |
+| S9 | **xhigh pre + xhigh post** (user decision 2026-09-09) |
+| S10 | none — user decision 2026-09-09 (program default) |
+| S11 | **xhigh pre + xhigh post** |
+| S12 | xhigh pre + xhigh post (polygon-topology checks, repository-grounded) |
+| S12b | xhigh brainstorm (plan) + **xhigh pre + xhigh post** (user: Astra "as needed", 2026-09-11) |
+| S12c | xhigh pre |
+| S13 | xhigh brainstorm (plan) + **xhigh pre + xhigh post** (user: Astra "as needed", 2026-09-11) |
+| S14 | **xhigh pre + xhigh post** |
+| S15 | xhigh brainstorm once (run 0 completed 2026-09-18) |
+| S15b | xhigh pre (+ post if the net-path kernel changes) |
+| S16 | high/xhigh once |
+| S17 | xhigh when changing algorithms |
+| S18 | **xhigh post** (repository-grounded) |
+
+If quota becomes tight, the non-negotiable Astra sessions are **S1, S2, S5, S8, S11, S13, S14 and
+S18** — where a false pass translates most directly into an electrically incorrect or
+unmanufacturable board.
+
+## Cross-cutting decisions and open items
+
+- **`integ/trace-drag`** (6 commits, +1905/−7, trace-segment drag + 555-blinker fab fixture) must
+  be merged or parked **before S1**. Its `PcbCanvas.tsx` / `PcbScene.tsx` hunks overlap master's
+  later work; the 555 fixture (`src/core/backend/tests/fixtures/blinker-555.ts` on that branch)
+  is wanted for S18.
+- **Fixture infrastructure** is a shared gap: the golden corpus is one 2-layer board, the parity
+  harness builds synthetic projections, and there is no KiCad project fixture in-tree. Each session
+  that needs a multilayer or realistic board adds it to `src/core/backend/tests/fixtures/`.
+- **Route-commit server gate** (today: none; all collision legality is client-side) — decided in
+  S8.
+- **Cloud contract boundary** — the cloud snapshot pins copper layers to 2/4 and strips
+  electrical/SI fields; nothing in this program assumes cloud and desktop DRC agree.
+- **S1 decisions (2026-09-06)** — connectivity = physical copper overlap on a shared layer
+  (`CONNECT_EPS_MM = 1e-6`, float noise only); two layer policies over one geometry (fail-safe for
+  connectivity, clamp for shorts); GND is an ordinary net (airwires + `UNCONNECTED_NET` until a
+  pour exists); `pcb.padShapeConnectivity` retired; free pads are graph nodes and ratsnest
+  endpoints (`RatsnestEndpoint`), omitted from cloud autoroute targets with a snapshot warning;
+  `checks/copper-pour.ts` keeps computing islands independently in S1 (S5 consumes the kernel).
+  Filed for later sessions from the S1 Astra/review ledger: fill-kernel layer predicates diverge
+  from the contract for `std` free pads on inner layers and for vias without a layer count (S5);
+  no DRC check for copper over an NPTH hole (closed in S7: `COPPER_TO_HOLE`); pad plating attribute missing (S11);
+  zero-neck corner contact and coincident duplicate traces (S12 DFM); segment-level broad-phase
+  (S9); contact locations for length walks (S14); default-exclude GND-class nets from cloud
+  autoroute targets? (cloud session).
+- **S2 decisions (2026-09-07)** — one polygonal board region for legality
+  (`src/shared/pcb-geometry/board-region.ts`), closed set at `GEOM_EPS_MM = 5e-7`, every arc
+  flattened toward the board side (`R_poly ⊆ R_true`, error ≤ 0.01 mm, tangent chains with exact
+  endpoints, refinement on flattening-induced self-crossing); `COPPER_OFF_BOARD` judges copper with
+  its width and co-fires with the unsigned edge gap; outline validity runs on the biased rings, so
+  touching / tangent / abutting cutouts and a cutout touching the edge are invalid (merge them);
+  self-touching rings invalid; full circles follow the chord rule with 64 as a floor;
+  canonicalised rings (full-radius rounded slots no longer falsely invalid); one inclusive segment
+  predicate, one arc sampler for outlines, pad-outline sampler left as a documented divergence.
+  Filed for later sessions from the S2 ledgers: exact disc for circular pads in edge + clearance
+  checks and a signed edge clearance / second-chance test inside the chord band (S7); copper-fill
+  extent from `buildBoardRegion` and its 0.005 mm via tolerance (S5); board-edge and cutout route
+  obstacles from the same region (S8/S16); spatial index — Astra's cost probe puts `checkBoard`
+  at ≈ 1.6 s for 300 pads × ten 100-chord cutouts, linear in pads × boundary edges (S9); exact-arc
+  contour validity, minimum-web / connected-material checks, Gerber true arcs (S12). Process note:
+  the first adversarial-verify run was cut off by the provider's content filter on the
+  "adversary / attack" scaffold wording; the re-run with verification wording completed — keep
+  the neutral scaffold (`scratchpad/s2/astra-adversarial-verify-prompt-v2.txt`) for later sessions.
+- **S3a decisions (2026-09-07)** — `PcbZone` v2: one zone = one layer, a persisted `netId` with a
+  `netName` import hint bound at projection time, `region` is `board | polygon`, an integer
+  `priority`, tighten-only clearance/min-width overrides, `padConnection` is
+  `solid | thermal | thruHoleThermal | none`, and `islandRemoval` composes onto the board default.
+  New `PcbKeepout`: a layer set plus five restrictions (`tracks`, `vias`, `pads`, `copperPour`,
+  `footprints`). A read-time v1→v2 upgrade (`upgradePcbZoneRecord`) is the only zone-payload reader,
+  including the legacy net-less rule — a v1 row with no net imports `enabled: false` so the data-
+  model change can never make it start pouring. One derivation, `collectCopperZones` /
+  `collectKeepouts` in `src/shared/pcb-areas/`, replaces the seven pour-list copies; the board fill
+  toggle stays view state and `applyLegacyBoardFillPolicy` (shared by the projection and the
+  canvas) is the one place that turns it into a board zone. One predicate, `keepoutAffects`, treats
+  a keepout as the open interior of its polygon at `GEOM_EPS_MM` (touching the boundary is legal),
+  with a rule per object class. `copperPour` keepouts are now subtracted from every fill (with a
+  grid-step guard so quantisation cannot round copper back into the keepout). KiCad rule areas
+  import as keepouts, with per-arc S2 bias; hole contours import disabled (fail-safe, zone imports
+  disabled rather than pouring more copper than drawn). The 3D preview now follows the same
+  effective list as Gerber, canvas and DRC. Filed for later sessions from the S3a ledgers: S3b —
+  storage migration of the fill toggle into board-zone rows plus an explicit per-zone net picker,
+  zone/keepout authoring commands, hole support in zone regions (flip the bias for hole rings),
+  selection/inspector; S4 — `KEEPOUT_VIOLATION` / `ZONE_OVERLAP` / `ZONE_OUTLINE_INVALID` / an
+  empty-fill warning consuming `keepoutAffects` and `DrcContext.copperZones`/`keepouts`, placement
+  extent (courtyard else pad+graphics bbox), route obstacles from keepouts, cloud snapshot
+  keepouts; S5 — inter-zone precedence/clearance in the fill (other pours as obstacles;
+  equal-priority symmetric exclusion), net-class clearance into the fill via the rule resolver
+  (S6), Gerber pour emission order vs LPC, `pcb_cleanup_pour_traces` widening, free-pad/rotated-pad
+  thermal spoke geometry, B3-9/B3-10; S9 — keepout predicate and precedence complexity bounds.
+  Process note: prompt-only Astra runs must use a neutral cwd (`/tmp/...`) and an explicit "reason
+  over the packet only" instruction — run 1 inferred the repo path from the scratchpad directory
+  name and burned the quota reading files.
+- **S3b decisions (2026-09-07)** — the per-layer copper fill is a persisted board-zone row
+  (`region: { kind: "board" }`, id `board:<layer>`, at most one per layer by id uniqueness), not
+  view state: `PcbViewState` lost `copperFillLayers` / `copperFillPourNetIds` /
+  `copperFillPadConnection`, `applyLegacyBoardFillPolicy` is deleted, and `collectCopperZones`
+  takes zone rows only (`padConnection` default is the constant `"solid"`). Legacy rows migrate
+  lazily through `migrateLegacyBoardFill` on every entry point that can write board settings
+  (projection load, dispatch, history replay), before the settings row is parsed — the row persists
+  the ground net's NAME (fallback hint `"GND"`), never an ephemeral id. Zone / keepout rows carry a
+  uuid row id with the entity id in the payload because `designer_pcb_entities.id` is a global
+  primary key. Six commands (`pcb_add/update/delete_zone`, `pcb_add/update/delete_keepout`; flat
+  optional fields + `locked`, per repo convention) with `routes.ts` parsers pinned by a full-field
+  HTTP round-trip test, undo/redo arms in the ECS world diff (payload id as entity id), ring
+  validity through the shared `zoneRingValidity` in the executor AND the tool. Tools: Zone (Z) and
+  Keepout (K) on the board-shape sketch machinery with an options bar (layer / net / pad
+  connection; layers / five restrictions, default all forbidden), edge-only hit-testing (an
+  interior hit would swallow marquee starts over a pour), vertex drag / insert / delete, an
+  inspector, `ZoneOutlineLayer` (solid ring / dashed ghost), and the layers-panel fill toggle now
+  driving the board-zone row (undoable; net + pad-connection pickers). Zone holes deferred to S5.
+  Filed for later sessions: interior-click selection and whole-object drag-move (UI follow-ups);
+  hole rings with the import-bias flip (S5); `knownNetIds` asymmetry in `drc-context` /
+  snapshot / Gerber (S4/S5); `parseDispatchResultJson` arms for the free-hole / free-pad / overlay
+  codes (housekeeping); `NetSelect` shows an unresolved zone net as "No net" (UI follow-up); a
+  `@openpcb/contracts` release mirroring the five new dispatch-result codes (the installed 0.2.6
+  copy adds one duplicated drift error to the typecheck baseline: 42 → 44). Gerber pour emission
+  order (explicit zones before the board plane, derivation order) is now pinned by a test. Process
+  note: the S3a golden delta prediction "none" held; the one modified golden in the tree is S1's
+  documented `UNCONNECTED_NET` change.
+
+- **S4 decisions (2026-09-07)** — legality integration (`03-zone-keepout-contract.md` §13). Four
+  DRC codes declared, emitted, labelled and tested together: `KEEPOUT_VIOLATION` (one per affected
+  item–keepout pair through `keepoutAffects`; traces, vias and pads on their DRC clamp layer sets,
+  placements on their side layer with a resolved extent), `ZONE_OVERLAP` (different-net polygon
+  zones on one layer with positive-area overlap — **any priority until S5** implements the §5
+  precedence carve, because today both zones pour the contested area and the Gerber carries a
+  short; S5 narrows it to equal priority), `ZONE_INVALID` (non-overridable, non-waivable: every
+  reason the derivation refuses an enabled zone or keepout — a dropped keepout is fail-open) and
+  `ZONE_EMPTY_FILL` (net-unbound zones and effective zones whose fill has no island). DRC consumes
+  the derivation's own warnings (`DrcContext.copperAreaWarnings`, a total mapping) rather than
+  re-deriving. **Parity is enforced by the compiler:** `pourParamsForZone`, `boardPourSpecs` and
+  `collectCopperZones.knownNetIds` lost their defaults, which exposed that only the canvas and the
+  3D preview had ever subtracted keepouts — Gerber, the snapshot pours, the DRC island check,
+  `pcb_cleanup_pour_traces` omitted the argument and the connectivity pours lost it inside
+  `BoardPourSpec` (the contract's S3a claim is corrected in §4 / §10.2). Placement extent =
+  courtyard hull flattened **outward** (circles at `r·sec(π/16)`, arcs through the S2
+  circumscribed chain — the plain hull undershot both, R1 finding) else the transformed
+  pads+graphics bounds else the pad bbox; the raw-KiCad courtyard lookup is a pre-fetched
+  `DrcOptions.lookupRawFootprint` built by every production entry point (DRC run, SDK, cloud
+  apply) so the engine stays a pure function of its input. Routing: `tracks` keepouts are
+  floor/ceil AABB superset obstacles, the live check runs the exact predicate per pending segment
+  (`trace-keepout`, commit-blocking like a clearance conflict), a `vias` keepout refuses a smart
+  via (tested on the nm-quantised centre), `placementSideLayer` is the one side resolution; no
+  server-side route gate (S8). Cloud: the vendored `BoardSnapshot` schema stays keepout-free; the
+  snapshot pours subtract keepouts and the apply-time DRC report surfaces `KEEPOUT_VIOLATION`.
+  Third golden `golden-areas-2l` (51 violations) pins the codes; the two older goldens are
+  hash-identical. Filed: S5 — fill kernel failure contract (`buildCopperFillIslandReport` throws
+  where the connectivity twin swallows; a kernel bail is indistinguishable from an empty extent),
+  narrow `ZONE_OVERLAP` once the carve lands, `BoardPourSpec` as a structural `Omit<ZonePourParams>`;
+  S7 — exact circle-pad discs for keepout verdicts, `custom`-pad `preview.bounds` superset check;
+  S8 — server-side commit gate, live `trace-keepout` dedupe per segment; S9 — live keepout check
+  and `checkKeepouts` are O(items × keepouts) without an index; cloud session — keepouts in the
+  wire contract. Process notes: `ZONE_INVALID` replaced the S3a-reserved name `ZONE_OUTLINE_INVALID`
+  (it covers layer and id drops too); the macOS shell has no `setsid`, so a long Astra run is
+  launched with `nohup … &` and a `Monitor` on a done-marker rather than a tool-timed command.
+  Astra adversarial-verify (xhigh, repository-grounded, one run): 5 findings, all verified by probe
+  and accepted — opposite-winding keepouts cancelled in the fill (blocker; rings now CCW-normalised
+  in the derivation and the kernel), `pcb_cleanup_pour_traces` deleted a trace bridging two islands
+  (blocker; coverage is now geometric single-island containment), a polygon zone over a board plane
+  of another net reached no check while Gerber `LPC` opened its pads (blocker; reported until S5),
+  duplicate-id rows on different layers gave order-dependent ids (fixed), an undersized authored
+  courtyard hid pads from the `footprints` extent (extent now hulls the pads). Ledger: contract
+  §13.8.
+
+- **S5 decisions (2026-09-08)** — copper-pour correctness (`04-copper-pour-contract.md`). **One
+  copper geometry:** the fill kernel classifies S1's `buildCopperRecords` records (real
+  `layerCount`, `resolvedLayers`, `declaredLayerInvalid` / `layerSpanInvalid`, the circumscribed
+  ring + exact disc, `rotationDeg` + `mirrored`) instead of its own pad polygons and 32-layer stackup;
+  a layer-invalid record is a different-net obstacle on every layer; `std` free pads pour on inner
+  layers. **Flattening bias per role:** every obstacle is a superset (circumscribed pads, vias and
+  trace caps — the inscribed caps under-cleared a 6 mm trace by 4.4 µm, R1), drills circumscribed.
+  **Extent** from `buildBoardRegion(…, "board-inner")` in one round inset (+`ε`, +0.01 on a fallback
+  ring); **conservative quantisation** (forbidden regions +`q`, the zone's outer ring −`q`).
+  **Clearance per obstacle net** `max(zone tier, class(pour net), class(item net), floor)` — a 0.8 mm
+  net class poured at 0.5 before (Astra run 1 #1, blocker); scoped rules stay S6. **Precedence** (S3a
+  §5) enforced: `pourParamsForZone(zone, rules, keepouts, zones, nets)` (five required arguments —
+  the S4 parity trick) emits exclusions of every other-net zone with priority ≥ this zone's, inflated
+  by the mutual clearance; `ZONE_OVERLAP` narrowed to equal-priority pairs. **Thermals** in the
+  pad-local frame (first spoke at 90°, reflected for mirrored pads; the old fixed world angle aimed
+  at corners). **Islands:** `buildCopperFillIslands` → `{ status: "ok" | "failed", islands }`,
+  islands canonical and in the total order for every consumer; `attached = memberKeys.length > 0`
+  is the removal criterion; every clipper primitive throws `CopperKernelError` (no `[]`-on-throw),
+  a collapsed union / positive dilation is `failed`, an erosion emptying is `ok`; `three` left the
+  kernel (`copper-fill-shapes.ts`). **DRC:** `pourResults()` computed once and shared by the
+  connectivity graph and `checks/copper-pour.ts`; `ISOLATED_COPPER_ISLAND` = S1 component without a
+  pad (B3-10), `measuredMm` dropped (B3-9), new `ZONE_FILL_FAILED` (non-overridable). **Consumers:**
+  Gerber emits per-net unions of the layer's pours in the total order (ancestor-first) with per-island
+  `%TO.N`, reads `projection.padNets`, and fails the export with a 422 problem on a failed fill or a
+  collapsed union; snapshot warns on a failed zone; cleanup covers explicit zones. **Zone holes**
+  (user decision: full): `region.polygon.holesMm`, `zoneRegionValidity` (strictly inside, no
+  contact, pairwise disjoint, no nesting) → `zone_hole_invalid` → `ZONE_INVALID`; KiCad hole
+  contours import enabled with outward bias; Shift+Z cutout tool, hole-ring vertex editing,
+  inspector. New golden `golden-pours-2l` (45 violations); `golden-areas-2l` lost exactly the
+  priority-pair `ZONE_OVERLAP`; `small` / `cutouts` byte-identical. Stated limits: the 0.5 mm floor and
+  scoped rules (S6), NPTH at the edge rule (S11), union necks (S12), per-pour removal, ≤ q/√2 Gerber
+  re-quantisation, no compute budget (S9/S10). Filed: cutout-ring drag has no live outline (UI);
+  `thruHoleThermal` on a `std` free pad with `drillMm` null and blocked-spoke relocation (S7/S12);
+  `region.fallbacks` branch has no fixture (`test.todo`); the KiCad parser test file lives outside
+  both runners; the ratsnest path builds copper records twice. Process: Astra run 1 (spec-attack,
+  prompt-only, ≈40 min) 15 findings — 11 accepted, 2 recorded limits, 2 rejected with source
+  evidence; R1 (reviewer-critical) 9 findings, R2 (reviewer) 6; Astra run 2 (adversarial-verify,
+  repository-grounded, ≈35 min) 9 findings, all traced and verified: obstacle windings cancelling
+  into a flood (blocker; rings normalised), circumscribed trace caps as false membership evidence
+  (exact segment contact now), the opening re-joining lobes through a sub-`w` neck (recorded limit,
+  §7 reworded, S12), the canvas' global-index via bucket (removed), cleanup deleting the trace that
+  kept its island alive (refill fixed point), KiCad hole classification on the inward outline
+  (outward now), slotted drills as discs (stadiums), a sub-grid obstacle vanishing inside a
+  non-empty union (`failed`), zero edge clearance skipping the `q` inset (always inset) — ledger
+  `04-copper-pour-contract.md` §15. Gates at close: backend 1845 / 22 known / 8 skip / 6 todo (1881),
+  tsc 44, Vitest 61 files 512 + 1 todo, gen clean, e2e 11/11.
+
+- **S6 decisions (2026-09-08)** — DRC rule semantics (`05-rule-semantics-contract.md`). **One
+  resolver:** `createRuleResolver(board, netNames, { validCopperLayers })` in
+  `src/shared/drc/rule-resolver.ts` (+ `rule-compile.ts`) is consumed by batch DRC, the live
+  route gate, route obstacle inflation, the pour composition (`ZonePourNets = { resolver }`) and
+  the via insert gate; `resolveRouteClearancesMm`, the live inline `max`, and the kernel's
+  `resolveCopperFillClearanceMm` / 0.5 constant are gone (the constant became the board rule
+  `pourToCopperMm`, absent = 0.5). **Scalar scoped rules enforce** (first match, then the board
+  minimum as the floor); **area scopes are evaluated on regions of constant membership** —
+  trace segments split at every area ring (`splitSegmentAtRings`), per sub-segment pair at the
+  closest points, largest deficit reported in the canonical (sorted-anchor) orientation — the
+  representative-midpoint false pass and Astra's single-segment two-hotspot case both close;
+  **multi-layer pairs** report the first violated layer with the maximum requirement and the
+  most severe input. **Severity:** drafts carry no literal (49 removed); `override → matched
+  rule → DEFAULT_SEVERITY_BY_CODE`; `NON_OVERRIDABLE` is the one non-waivable list;
+  `HOLE_TO_BOARD_EDGE` breaches → `HOLE_OFF_BOARD` (an `"ignore"` override is copied on read).
+  **Validity:** `pcb_set_design_rules` refuses malformed rules (`INVALID_DRC_RULE`, nothing
+  persisted); persisted invalid rules → `DRC_RULE_INVALID` (non-overridable), partially
+  ineffective / clamped rules → `DRC_RULE_INEFFECTIVE`; 31 area polygons max. **Pours:** per
+  obstacle kind (`pourToTrace/Pad/Via`, `pourToPour` for zone–zone with masks 0), only rules
+  with an explicit pour `pairKind` scope reach a fill, area scopes never relax a fill.
+  **Comparison regime:** `clearanceViolated = gap < required − GEOM_EPS_MM` (0.5 nm grace;
+  P-A2 still fires). **Options default from the projection**, so the assistant / MCP report
+  equals the HTTP report. **Store:** update path preserves optional keys (`electrical`, floor,
+  `holeToBoardEdgeMm`, `pourToCopperMm`; `null` clears), read path never invents them; new
+  boards get floor 0.1; fixtures and goldens stay floor-free; stale (non-v2) waiver ids pruned.
+  **Default class** stays `netClasses[0]` (one helper `defaultNetClassId`; Astra showed a
+  `default`-id preference would silently change boards). **Live gate:** every (pending
+  sub-segment, neighbour sub-segment / pad) pair through the same procedure, pending class from
+  the net, short tier refuses; router inflation is a stated heuristic. **KiCad import:**
+  `design_settings.rules` → minimums / floor / edge, `Default` class → board clearances,
+  `nets` / `netclass_patterns` / `netclass_assignments` → per-net assignments, `.kicad_dru` →
+  warning. **User decisions:** no scoped-rules UI (filed), explicit pour rule + pour pair kinds,
+  waivers stay ids, Astra xhigh once. Codes 48 → 51. Goldens: `small` / `areas` / `pours`
+  byte-identical, `cutouts` changed by exactly the one `HOLE_OFF_BOARD` id (`c611f7…` →
+  `e5afb6…`), new `golden-rules-2l` (`773252…`). Stated limits: area relaxations never reach
+  pours (exact clipped halo filed), sub-segment products are `O(n·m·(R+V))` on pairs that meet an
+  area (S9), gate covers trace–trace / trace–pad only (S8), scoped rules not in the cloud
+  snapshot, `CREEPAGE_DISTANCE` keeps `below()` (S13), `zonePourNets` compiles per call (hoisted
+  in the 3D preview), `ruleResolverFor` loads the schematic projection per via insert. Process:
+  Astra run 1 (spec-attack xhigh, prompt-only, ≈25 min, 27k tokens) 15 findings — 14 accepted,
+  1 limit, 0 rejected; R1 (reviewer-critical) 10 findings all fixed or routed (incl. a pre-existing
+  fast-path determinism hole); R2 (reviewer) 7 findings all fixed (the save validator on a partial
+  payload, the two undeclared snapshot keys — now stripped —, the parity test's missing gate leg). Gates at close (frozen tree): backend 1952 pass / 22 known / 8 skip / 6 todo (1988),
+  tsc 44, Vitest 62 files 527 + 1 todo, gen + contracts clean, e2e zones + board-shape + routing
+  13 passed + 1 flag-skipped (an earlier fill-toggle click timed out only while the full backend
+  suite ran concurrently — run e2e on an idle machine); census greps empty (no
+  `resolveRouteClearancesMm` / `resolveCopperFillClearanceMm` / `clearanceForNetMm` /
+  `computeViolationIdV1`, no product `netClasses[0]`, no severity literal in a check). Tree: 125
+  files modified (+15669 / −4883), 223 entries incl. untracked, S0–S6 all uncommitted.
+
+- **S7 decisions (2026-09-08/09)** — user: `COPPER_TO_HOLE` now (optional `clearance.copperToHoleMm`,
+  absent = the edge rule the pour's NPTH halo has always used; KiCad `min_hole_clearance` maps to it),
+  `UNCONNECTED_NET` derived in-engine (`ratsnestFromConnectivity` split out of `computeRatsnest`), the
+  exact-arc second chance deferred to S12, one post-implementation Astra run. Fable: canonical report
+  (`(code, id)` sort, unique ids with a most-severe / largest-deficit dedupe, byte-identity under the
+  eight input reversals; `drcRules` order stays semantic for equal-priority ties), `drc/pair-gap.ts`
+  as the one gap kernel (exact `disc` for circles; `exactShape=false` bounding rects out of the
+  intra-footprint short tier), intra-footprint different-net overlap and null-net bridges are shorts,
+  one free-pad drill / layer derivation (`freePadDrill`, `freePadCopperLayers`) consumed by records,
+  DRC, pour, Gerber (NPTH `hole` pad flashes no copper, keeps mask relief), Excellon, snapshot, canvas,
+  `RULE_CLASS_BY_CODE` + `EMIT_SITE_BY_CODE` compiler-total with a corpus census gate
+  (`golden-census-2l`; every code but `ZONE_FILL_FAILED`), cutout milling advisories with material
+  outside the ring (winding from the flattened contour), signed `COPPER_TO_BOARD_EDGE.measuredMm`,
+  `TRACE_LAYER_MISMATCH` non-overridable, all eight class ignores persist, creepage skip only without
+  area rules and never inside a footprint, strictest IPC column, canonical trace order for length / SI
+  sums. Stated limits: footprint NPTH pads read as copper (no plating attribute, S11); connectivity's
+  circumscribed oval / roundrect rings can fabricate contact (S1/S2 limit, S11); slot width vs
+  `drillMm` split (S11); mask policy for drilled `smd` / `conn` pads (S12); chained null-net bridges;
+  Gerber pad rotation / ellipse (B6-1, S11). Goldens: `cutouts` +4, `pours` +2 (fixture artefacts:
+  overlapping footprint pads), `census` new, all six regenerated in canonical key order. Gates at
+  close: backend 2051 pass / 22 known library+assistant fails / 8 skip / 7 todo (2088); tsc 44; Vitest
+  531 + 1 todo; gen + gen:contracts clean; e2e zones + board-shape + routing 13 + 1 flag-skip.
+  Process: R1 (reviewer-critical) found a byte-identity hole, id collisions and a regression the
+  session itself introduced — run it on every pair loop with reversal probes; an implementer's
+  `git stash` around a tsc run briefly reverted the shared tree — forbid it in briefs; Astra run 1
+  (≈ 40 min, 235 k tokens) 8 findings, 5 fixed, 2 contract corrections, 1 registered (B6-1).
+- **S8 decisions (2026-09-09)** — user: server-side commit gate = **refuse with explicit opt-out**
+  (`legality: "refuse" | "report" | "off"` on the five copper commands; the desktop sends `report`
+  while its DRC-override toggle is on; the cloud apply loops send `off`; assistant / MCP get the
+  reference verdict in the refusal), **full engine relocation** to `src/shared/drc/` behind
+  one-line shims (six pure backend deps moved with it; `board-connectivity` / `ratsnest` stay out
+  of the `pcb-connectivity` barrel), **tune commits join the gate now**, **live judges the full
+  pending-item code set** (contract 07 §3). Design: live legality = the batch pair bodies
+  (`PairJudge`) run on a per-revision `LegalityContext` (`buildDrcItems`, uniform-grid broad
+  phase) with the pending copper as the subject set (`checkPendingCopper`, `judgeCopperPairs`
+  with its own enumeration; batch loops verbatim); the parity statement is two clauses
+  (attribution equality + non-perturbation with `replaced(T)` bridges) compared with `===`; the
+  refuse set is an allow-list by code; the executor builds the gate context from the rows the
+  dispatcher already loaded (never `loadPcbProjection`, which writes); no truncation exemption;
+  obstacle inflation = `max(at obstacle, implicit, SHORT_EPS + 1 nm)`. Plan-critique pass (20
+  findings, 5 blockers) folded before implementation. Astra run 1 (spec-attack xhigh,
+  prompt-only, ≈16 min): 9 findings — 7 accepted (replaced-bridge clause, no truncation
+  exemption ×2, obstacle inflation ×2, `worseWitness` message tie-break, logical-anchor bridge
+  completion memoised per context), 1 rejected as a defect but recorded as the immutable-snapshot
+  guarantee the client memo rests on, 1 kept as a cost bound (`07-live-parity-contract.md` §11).
+- **S9 decisions (2026-09-09)** — user: S8 committed first (`00e7da8`), both Astra runs (the
+  program had the post-run optional), creepage candidate discovery included (rules untouched).
+  Fable: **candidate discovery through two indexes built once per context** — the S8 grid becomes
+  grid v2 (trace entries filed per sub-segment of ≤ `CELL_MM`, a `nearPolyline` query for trace
+  subjects, distinct-cell / piece / query caps and a safe-integer bail that all fail OPEN, a fixed
+  query slack) and a new boundary-edge index on the board region (`region-index.ts`: `edgesNear`
+  for distances and contact parameters, a row-band table for the ray parity; the region predicates
+  take it as an optional trailing argument and are the pre-S9 functions without it) — while every
+  verdict is reached by the unchanged bodies; **the pre-S9 enumerations are moved verbatim behind
+  `DrcOptions.broadPhase: "exhaustive"` as the permanent oracle** (option-only: tests and
+  `scripts/drc-bench.ts`); identity is stated as three lemmas (pair superset under halos that
+  bound every resolvable requirement; min-over-subset with one primitive in one argument order,
+  unhaloed where a value is reported; ray parity over a closed row band with the ring loop's
+  operand order) and proven at the draft level, not only the report level. Each halo is an
+  explicit max over the terms the checks compare against and a tested inequality. Recorded
+  corrections in both modes: a ring of fewer than two vertices files no boundary edge;
+  `COPPER_TO_HOLE` anchors lead with the smaller key; an unmeasured same-id survivor keeps the
+  smaller marker. Plan-critique (Opus, 17 findings incl. 5 blockers) folded before the contract.
+  Astra run 1 (spec-attack xhigh, prompt-only, 11 min): 7 findings — 5 accepted (one-point trace
+  entries, PIP operand orientation, safe-integer cell indices, `(key, index)` creepage ownership,
+  row-band caps), 1 rejected on the source (obstacle rects are per segment), 1 addressed by the
+  halo property test. R1 (`reviewer-critical`, 1 500 adversarial boards): 2 blockers
+  (`COPPER_TO_HOLE` anchor order; a one-vertex outer ring's `nearRing`), 2 majors (NaN voltage in
+  the creepage halo; multiplicity cell count oversizing 350 mm traces), 4 minors. R2 (`reviewer`):
+  1 blocker (the draft-level assertion could silently disable itself), 7 harness-coverage majors.
+  Astra run 2 (adversarial-verify xhigh, repository-grounded, 14 min): 5 findings — 1 blocker
+  accepted (the R1 NaN fix made the halo propagate to the 2.5 mm band, below what a finite 800 V
+  pair needs — the halo now fails open to `Infinity`), 2 accepted (unmeasured survivor marker; the
+  boundary fixture's arithmetic), 1 rejected as the documented 06 §7 exception (now an explicit
+  test), 1 low accepted (piece memo). Stated limits: PIP linear per row band; `cellMm` not
+  threaded to `buildDrcItems`; `edgeTests` counts sites; the slack is absolute; pours,
+  `signal-integrity`, `outline`, `zones`, the area sub-segment products and the server context
+  memo (S10) unchanged. Process: the S8 lesson held — a Plan-critique agent before the user
+  questions, Astra before code, two reviewers on disjoint surfaces, every finding probed before
+  acceptance; the Bash cwd persisting inside `&&` chains cost three wrong `tsc` counts (21 vs 44)
+  — always `cd` back to the root in the same command.
+- **S10 (2026-09-10) — the batch run moved off the request thread.** Decisions (user,
+  2026-09-09): S9 committed first; a `node:worker_threads` worker, not cooperative slicing (the
+  pour kernel is indivisible per zone and can only be stopped by terminating the thread; the
+  backend runs in-process on Electron's main process, so a blocking run stalled the desktop
+  shell); a designer-local `DrcRunService`, not the `tasks` module (ephemeral runs, supersede
+  semantics, no task rows); program-default review, no Astra, no Codex. Landed: contract 09;
+  `DrcOptions.tick` as the only engine seam (the 17 stages became an exported, test-pinned
+  `DRC_STAGES` table; a per-zone tick in the pour loop; zero check-body edits); the worker +
+  client under `src/shared/drc/worker/` (persistent, cooperative cancel by shared flag with a
+  250 ms terminate fallback, respawn, spawn-failure → `failed`, explicit dispose — `unref()`
+  does not let Bun exit); a fourth tsup bundle, asar-unpacked, `setDrcWorkerEntry` from
+  Electron main; `DrcRunService` (join on `(revision, optionsDigest)`, supersede re-attaches
+  waiters, FIFO across designs, persistence only after `done` behind a synchronous head check,
+  a deleted design → `cancelled`); four run routes + SSE; every batch caller through
+  `runAndWait`; `req.signal` now also fires on `close`; the frontend run controller (progress
+  bar, Cancel, previous report dimmed, poll fallback); B5-SYNC live. Retired by analysis: the 07
+  §9 per-revision commit-gate memo (it cannot hit on a sequence of successful commits).
+  Plan-critique (Opus, 17 findings incl. 3 blockers) folded before code; R1
+  (`reviewer-critical`, 25 adversarial tests) found the tsup `clean: true` race that deleted the
+  worker bundle on every watch rebuild and an unwired id-only smoke — both fixed; R2 in §11.
+  Process: the frontend package ran in parallel with the worker package against the contract's
+  wire table, and the run service after the worker — no rework between them.
+
+- **S11 (2026-09-10) — holes, pads and vias have one manufactured model.** Decisions (user):
+  S10 committed first (`523d8f8`); S11 committed BEFORE the sibling `shared/` tags (the new
+  render-source pad fields `plated?` / `drillSlotMm?` / `drillOffsetMm?` are optional and read
+  through one narrowing helper, `padDrillFields`, so the app passes its gates against the PINNED
+  packages; the tags `kicad-parsers-v0.1.4` / `kicad-import-v0.2.0` / `rendering-core-v0.1.4`, the
+  repin + `npm install` lock refresh + real `npm ci`, and the CoreLibrary `rebuild-previews` are a
+  separate follow-up commit); B6-1 = rotated aperture macros (no `%LR`); both Astra runs. Fable:
+  holes derive from the DRILLED OBJECTS, never from copper records (a copper-less NPTH pad is
+  still a hole); the annular ring = `min over the drill centreline of signed sdf − r_tool`
+  (analytic per shape, convex ⇒ endpoint minimum, breakout `≤ GEOM_EPS` judged before any
+  minimum); copper-less ⇔ the copper is contained in the drill (farthest-point bound, fail-safe);
+  an unplated pad's copper ring is mechanical — per-layer null-net kernel items, no pour
+  membership, a net bound to it = permanent airwire + `NPTH_PAD_NET`; legacy library rows derive
+  plating at read time from the stored raw KiCad pad type with an identity match; sourced fab
+  rows (`minNpthDrillMm`, plated / NPTH slot widths, `npthAnnularRingMm`, `viaTypes`; JLCPCB +
+  PCBWay pages fetched 2026-09-10); `VIA_TYPE_UNSUPPORTED` (error) for every non-through via on
+  every fabricator because the Excellon export writes one through-drill file — and the export
+  refuses such boards; `VIA_ASPECT_RATIO` = thickness / drill for through vias only (the linear
+  span model deleted); the Gerber flashes copper, mask and paste from the S1 records (rotated
+  macros, `WasherPad` per the Ucamco spec, the roundrect clamp shared with the ring builder); a
+  `circle` pad is a disc of `widthMm` everywhere; the `.kicad_pcb` importer reads the bare
+  `blind` / `micro` atom (buried by span); the job file reports the real thickness. Review:
+  plan-critique (Opus, 18 findings, 5 blockers) folded before code; Astra run 1 (spec-attack,
+  prompt-only, 16 findings: 2 blockers — a net-bound NPTH ring bridging faces through the
+  ratsnest pin union, and a blind via exported as a through drill — 13 folded, 1 rejected: the
+  same-id survivor is already total); R1 (`reviewer-critical`, 7 findings — 3 majors: the
+  unequal-circle ring vs disc, the ellipse containment, the free-pad slot tool width — all fixed
+  with `drc-s11-review-fixes.test.ts`); R2 (`reviewer`, accept, 6 minors — the holes golden
+  gained a mirrored 30° placement with rotated oval / roundrect / explicit-layer / slotted pads);
+  Astra run 2 (repository-grounded adversarial-verify): run 2a was cut off by the OpenAI usage
+  limit after ≈175 k tokens, its trajectory still yielded two accepted high findings (a net-bound
+  copper-less NPTH pad was silently unroutable; the per-layer split stripped the net from
+  single-layer drilled `smd` / `conn` free pads — both fixed, contract 10 §2.4) and a precision
+  statement (§6.3); run 2b, re-launched at the usage-window reset (user decision), completed with
+  6 findings, all accepted and fixed — free-hole slots judged on the row's `drillMm` instead of the
+  slot width (now `freeHoleDrill`, the one free-hole derivation), a degenerate footprint slot
+  falling back to `drillDiameterMm`, a slotted `hole` free pad's mask relief, the via annulus
+  escaping the breakout check at a 0-minimum, an empty legacy index token binding raw pad 0, and
+  an early dedupe of `NPTH_PAD_NET` breaking byte identity — regressions in
+  `drc-s11-review-fixes.test.ts`; ledger in contract 10 §12.5. Deferred with
+  owners (10 §0/§10): trapezoid / custom outlines (S12b), per-span drill files and a stackup depth
+  model (S15 / export backlog), scoped hole rules (05 §13), slot authoring UI, canvas / 3D slot
+  and NPTH rendering, the editor "plated" toggle, PCBWay HDI presets.
+
+- **S12 (2026-09-11) — DFM overlays and copper shape on the artwork the fab receives.**
+  Decisions (user): the exact-arc set and polygon pads re-owned to a new **S12b** session before
+  S13 so S12 kept one objective; the copper-shape check judges the FULL per-(layer, net) union of
+  pads + traces + vias + pour islands (not pours only); the silkscreen export was completed
+  (footprint silk graphics and reference designators had never been exported; overlay rect /
+  circle / polygon shapes were exported as their two stored points); the seven new design-rule
+  fields are backend-only (UI under P12); both Astra runs. Fable: ONE artwork model
+  (`src/shared/rendering/pcb/artwork/` — silk strokes / regions, mask openings with `ownerKey`,
+  the two placement predicates `mirrorX` vs `sideFlip`, the one text rule, drill relief that
+  always contains the drill, the far-face relief of a drilled `smd` / `conn` free pad) consumed
+  by the Gerber writer AND the checks, proven 1:1 by `gerber-silk-parity.test.ts`; per-side
+  courtyard REGIONS (chained edges, depth-oriented NonZero union, superset-hull fallback on
+  malformed, 0.25 mm IPC-7351B level-B box fallback) with overlap by kernel intersection;
+  silk / mask checks on a SIGNED filled-set gap (containment first) with the fab rows sourced
+  from the JLCPCB + PCBWay pages (fetched 2026-09-10; `maskDamMm` finally has its emitter);
+  copper connection width judged on the EROSION cores (the opening cannot see a neck shorter
+  than the disc reach), necks enumerated as the opening's residual channels that join two cores
+  (parallel and curved channels included) plus bisection for the short necks, slivers as
+  thickness-classified residuals, everything batch-only with an explicit budget and
+  `COPPER_SHAPE_UNCHECKED` — never a silent pass; sixteen `dfm` codes, four stages (17 → 21), a
+  per-item `copperShapeUnit` tick label like `pour`. Review: plan-critique (Opus, 16 findings, 5
+  blockers — residual classification by extent, the pour's 7-gon opening, one mirror predicate,
+  per-component necks, the `covered` short-circuit) folded before code; Astra run 1 (spec-attack,
+  prompt-only, 23 findings: 21 accepted — the opening's blind spot for short necks, the proximity
+  cutoff, sub-`w` exclusion, null-net units, the thickness gate and corner arithmetic, the neck
+  midpoint, the 64-cap, inscribed caps, containment, pours and the net exemption, overlapping
+  openings, negative expansion, even-odd courtyards, arc de-dup, filled-set silk, the silk row's
+  target, crossings and 1 nm junctions, covered wedges, the angular epsilon, tie-breakers,
+  quadratic pairing — 1 in part, 1 rejected: a `hole` free pad's declared size IS its authored
+  opening); R1 (`reviewer-critical`, 1 blocker — the raw KiCad courtyard payload is arrays +
+  `pts`, so every imported part read as malformed and the S4 hull's raw path had never matched a
+  real row — 4 majors, 3 minors, all fixed); R2 (`reviewer-critical`, 2 blockers — a curved
+  channel located in empty board and double-reported, parallel necks reporting only the wider —
+  1 major, 8 minors, all fixed; the reviewer disclosed an accidental `git stash` + pop, tree
+  verified intact); Astra run 2 (repository-grounded adversarial-verify, 6 executed counterexamples, all accepted
+  and fixed — a channel to a third lobe hid a series short neck, a negative expansion shrank a
+  `hole` pad's opening below its drill, a copper-less relief bridging two nets passed the pairwise
+  merge rule and a thermal pad's vias read as a sliver, nested cores located inside the frame,
+  nested 8 192-vertex annuli spent 6 s unbudgeted, the initial erosions bypassed the budget;
+  contract 11 §12.5).
+  Goldens: `golden-dfm-2l` new (117 primitives, 43 violations, all fifteen reportable codes);
+  `small` +`COPPER_SLIVER` 1 (a 0.03 mm probe trace) +`TRACE_OVERLAP` 3 (same-net duplicate runs);
+  `census` +`FAB_MASK_BRIDGE` 1 +`FAB_MASK_TO_COPPER` 2; `holes` +`FAB_MASK_TO_COPPER` 1 — every
+  hit attributed in the golden's `.md`; `areas` / `cutouts` / `pours` / `rules` byte-identical
+  (the `pushCircle` change moved nothing). Recorded limits (11 §10): a short sub-`w` bridge
+  parallel to a wider short bridge, the residual neck width is a local chord, the 1 µm sliver
+  floor, a per-board copper-shape budget, mask colours / 2 oz rows, silk-over-silk, courtyard
+  off-board, board-level courtyard overlays, canvas font ≠ stroke font, pour-derived id re-hash.
+  Process: WP2 / WP3 / WP4 as three `impl-critical` briefs (WP3 + WP4 in parallel on disjoint
+  files; the shared golden fixture was clobbered once by a whole-file generator and restored by
+  id — never regenerate a shared fixture wholesale); the disk filled mid-re-baseline (user
+  cleared it; the tracked goldens were verified at their baseline shasums before re-running).
+- **S12b (2026-09-11) — exact-arc geometry.** Decisions (user): polygon pads re-owned to a new **S12c** row (three shared packages, a third tag round, no fixtures); the editor's `validateContour` shares the exact self-intersection predicate with DRC (S2 #8 closes end-to-end); the canonical contour arc (start radius, authored end point projected radially) is DERIVED at read by every consumer (`flattenOutline`, `exactContour`, the validator, the Profile) and never persisted — Astra run 1 #11 showed a projected endpoint rounded to integer nm is not a fixed point, so the user's write + read decision was refined to read-only with the same intent and no release-note event; `OUTLINE_MIN_WEB` is the `outline.minWebMm` design rule only, a fab row only with a sourced value; Astra run 0 (brainstorm, plan mode) + run 1 (spec-attack) + run 2 (repository-grounded adversarial-verify), all xhigh. Fable: copper = convex core ⊕ disc with closed-form `roundedGap` (`disc` stays; `r === 0` delegates to today's primitives; whole-core containment; halo = `edgeHalo + r`); board-edge verdicts on a certified interval `R_inner ⊆ R_true ⊆ R_outer` with exact recomputation only when the interval straddles the threshold (the "witness edge is an arc" trigger was broken twice by Astra run 0); the web is an erosion feature (the S12 copper-shape kernel on the 1e-4-flattened material region), not a pairwise primitive distance; the Profile emits ≤ 90° arc pieces with one quantised centre and integer I/J and never repairs a centre. Plan-critique (Opus, 29 findings, 11 blockers) and Astra run 0 ledgers in contract 12 §12.0. Review: plan-critique (Opus, 29 findings, 11 blockers) and Astra run 0 folded before the contract; Astra run 1 (spec-attack, 18 findings, all accepted — the canonical curve derived not persisted, arity-dispatched distances, the indexed halo carrying the ring bound, the edge-interval exact containment, the contact-run web rule, zero-chord Gerber pieces, the 2√2 nm radius bound); R1 (`reviewer-critical`, 10 findings — the summed-first grouping's 4e-17 mm flip window recorded, `endCapTouches` / `viaTouchesOnLayer` switched, the negative-radius guard); R2 (`reviewer-critical`, 6 — the budget note had downgraded the commit gate's off-board refusal, fallback rings ARE authorable and are now fixtured, a degenerate ring's Profile falls back with a warning); Astra run 2 (repository-grounded, 4 executed counterexamples — the erosion-free ring-pair web arm, the per-item exact budget, fallback from both region builds, pre-quantisation material area). Goldens: `golden-arcs-2l` new (83 primitives, 37 violations, attributed); `census` one `BOARD_OUTLINE_INVALID` id moved to the exact contact witness; the other seven byte-identical. Gates at the program baseline. Files > 500 lines to split after S12c: `checks/board.ts` (1078), `manufacturability.ts` (525).
+
+- **S14 (2026-09-13) — SI v1 mathematical correctness.** Decisions (user defaults accepted
+  2026-09-13): copper inside pads AND via barrel discs is not routed length (entry-point
+  attachment, every interior interval clipped); only a through via traversed outer-to-outer has a
+  barrel length (`boardThicknessMm`), everything else `NET_LENGTH_UNDEFINED(via)`; ≥ 3-pin nets
+  measure the tree total for length groups and are `multi-terminal` for skew; bare `P`/`N`
+  auto-pairing dropped; auto-detected pairs still judged; no target → `DRC_RULE_INEFFECTIVE`
+  (the 1.0 mm fallback window removed), `couplingMaxGapMm` explicit with today's `4·t + 0.1`
+  default; `open` / `terminals` silent; identical duplicate records are a `loop`. Fable: junctions
+  are emitted by the S1 sweep on request (opt-in, per contact component, from the SAME witness
+  the union used — S1 results byte-identical either way); the path graph clips terminal interiors,
+  contracts zero-weight joins, decides uniqueness by the bridge-only forest and measures the
+  minimal terminal-spanning subtree (no shortest-path anywhere); pour bypass = an island group
+  meeting the subtree in ≥ 2 contact components; coupling = closed-form sublevel intervals
+  (`coupled` / `tight` gate-free, `wide` on near-parallel strips only — the golden authoring showed
+  cap / corner departures firing `DIFF_PAIR_GAP` errors — `DIFF_PAIR_GAP` = max over members of
+  the off-band coupled length, uncoupled per member in 2D, skew for chains only, `below()` regime);
+  one diff-pair resolver with conflicts and ambiguity reported; the route / tune HUD reads the
+  same model (`≈` while a path is undefined). Review: plan-critique (Opus, 26 findings, 3
+  blockers — zero-weight cycles, envelope maxima, per-shape terminals) folded before the contract;
+  Astra run 1 (spec-attack, 15 — interior self-contacts, body-only pad attachment, interior
+  clipping, inner-layer via z, tree skew, pour bypass, bridge-only forest instead of a walk,
+  duplicate records (bound), the lost maximum-gap verdict, point targets, the 5e-7 regime, no
+  parallelism epsilon, cluster diameter, rule / identity ambiguity, the NP-hard walk); R1
+  (`reviewer-critical`, 11 — pour bypass at item granularity, a vacuous determinism fixture,
+  index-adjacent merge fusing crossings, the self-cap witness, O(n²) self scan, silent `pour`);
+  R2 (9 — the tune gauge clamp contradicting batch, `t + tol > G`, explicit-row conflicts,
+  `n/a` members, census attribution, waiver carry-over recorded, id migration recorded); Astra
+  run 2 (repository-grounded, 8 executed — repeated via contacts, endpoint-matched widths
+  suppressing GAP, the 15° gate flipping under reversal, collinear subdivision faking a pour
+  bypass, overlapping islands bypassing jointly, order-dependent conflict ids, self-pair claims,
+  a quadratic sweep). Dead ends ruled out: a shortest terminal-spanning walk (NP-hard on cyclic
+  terminal sets); `wide` as a bare strip union (a doubling-back partner made on-target copper
+  wide); uniform-stackup inner-layer z (7× wrong for a microvia); `tight ∪ wide` summed over both
+  members (double-reported one stretch); an angle-free `wide` (every cap an error row). Files
+  > 500 lines after S14: none new (`PcbCanvas.tsx` 6 879 pre-existing).
+
+
+- **S15 (2026-09-18) — high-speed architecture runway.** Decisions (user): Astra run 0 approved at
+  xhigh, prompt-only; scope **T1+** — the compatibility contract, the one true dead end fixed, the
+  side defects registered — with the stack-up model split off as **S15b** (the user's first lean was
+  the full persisted stack-up in-session; Astra run 0 showed its via-length rule non-additive and
+  `boardThicknessMm`'s bounding surfaces unsourced, so it needs its own contract and spec-attack);
+  the 6+-layer export is registered AND refused (422), not fixed. Fable: `NetPath` is a lossy RESULT,
+  not a dead end — persisted copper regenerates the junction graph, so future SI consumes the graph
+  and no result shape changes now (the plan-critique's two "blocked" verdicts overruled by Astra
+  and by the fact that nothing is destroyed); the only irreversible loss is the whitelist settings
+  parser erasing a newer build's keys → ONE serializer for every board-settings write
+  (`backend/pcb/board-settings-serialize.ts` + `board-settings-known-keys.ts`): `schemaVersion`,
+  unknown keys carried at the top level, in `designRules` + sub-blocks, in `viewState` +
+  `autoLayoutConfig`, on id-keyed rows and their nested objects, every unparseable row rescued raw
+  with its net-class assignments, scopes paired by CONTENT, the typed projection untouched; the
+  binding extension rules (contract 15 §3: graph not scalars, join-never-rename, nominal ≠ finished,
+  reference planes derived, broadside = new measure, extended nets = composition, stitched copper =
+  a result variant, canonical-grid stack numerics) and **"extend by new keys or row variants, never
+  by new values of an existing key"** (an older build rewrites an enum value it cannot parse).
+  Review: 3 Explore scouts; plan-critique (opus `Plan`, 24 findings / 6 blockers — folded, two
+  overruled, five deferred to S15b); Astra run 0 (brainstorm, 7 questions, every claim verified);
+  R1 (`reviewer-critical`, 16 executed probes, 9 findings: #1 high — index-paired scopes MOVED a
+  newer build's per-scope keys onto another scope; id-less / duplicate-id unparseable rows dropped;
+  a rescued class lost its assignments; `viewState` internals still erased; `__proto__` dropped;
+  the export refusal invisible in the dialog and thrown out of the assistant tool — all fixed; three
+  recorded as limits in 15 §2.1). No post-implementation Astra run (allocation spent; the change is
+  outside the DRC / geometry kernels). Gates at close: backend 3068 pass / 22 known
+  library+assistant fails / 8 skip / 0 todo (3098); tsc 44; Vitest 66 files 594 + 1 todo;
+  gen:contracts clean, `gen:check` fails only on the pre-existing `gen:copilot-schemas:check`
+  ENOENT with no generated file dirty; worker smoke byte-identical (census 85); e2e DRC + routing +
+  live-parity 5 + 1 skip; `package-lock.json` 034652c3; all eleven golden fixtures untouched (no
+  DRC code, no verdict and no id moved). Filed: S15-3..S15-9 in `OPEN_FINDINGS.md`.
+- **S13 (2026-09-12) — electrical-rule fidelity.** Decisions (user, 2026-09-11): the IPC-2221
+  conductor spacing is a NON-RELAXABLE CONSTITUENT term of the one rule resolver — its own
+  `CREEPAGE_DISTANCE` row (same id derivation) beside the ordinary clearance row, so the pour halo,
+  the route obstacles and the live gate inherit it by construction; `CREEPAGE_DISTANCE` refuses at
+  commit and `TRACE_CURRENT_WIDTH` warns live; `electrical.outerConductors: "coated"` selects B4 —
+  refined after Astra run 0 to per-item, per-face mask EXPOSURE (a global switch passed exposed
+  pads); the rules UI stays backend-only (P12). Fable: unassigned copper takes the tier net of
+  its connected component over trace / pad / via contacts at `SHORT_EPS_MM` (pours excluded —
+  circular with the pour; inexact pads never join; an unplated pad is one node per face), chain
+  shorts reported, the live gate builds a per-call overlay and rejudges existing items whose tier
+  or exposure the pending copper moved (B7-1 closed, the S7 chain limit closed); voltages are DC
+  potentials with optional `voltageMinV` / `voltageMaxV` intervals, Δ = max(|a.min − b.max|,
+  |a.max − b.min|) at 1 µV (Astra run 0 broke signed AC-peak subtraction), undeclared = reference
+  (stated assumption); Table 6-1 pinned to IPC-2221B from two agreeing transcriptions (KiCad 8 @
+  `942661f`, smpspowersupply; IPC-2221C differs, never mixed), the in-repo standards reference
+  corrected (251–300 V row, 1.378 mil/oz, recomputed width tables); the current verdict is a
+  per-item form with inner / outer copper weight; malformed electrical input is a
+  `DRC_RULE_INVALID` row, never assessed; the store persists declarations and only the resolver
+  refuses them. Review: plan-critique (Opus, 20 findings, 6 blockers) and Astra run 0 folded
+  before the contract; Astra run 1 (spec-attack, 13 findings — same-class intervals, pour / router
+  tier plumbing, the pour's exposure-blind cache, tenting ≠ coverage, live exposure changes, a
+  direct short hiding a chain, bounding-rect contacts, per-item rejudge, zero rise, float
+  boundaries, byte-identity claims, NaN voltages, the quadratic cliff); R1 (`reviewer-critical`,
+  WP2 7 + WP3 4 findings — the live rejudge re-reporting the board's own rows, the router's
+  untiered route side, `replaces` identity, zone↔zone exposure, ±1e308 overflow, the store
+  dropping a stored rise); R2 (`reviewer-critical`, 9 — the current skip on voltage problems, the
+  unpinned rejudge, message wording, the standards tables); Astra run 2 (repository-grounded, 4
+  executed — unplated pads conducting between faces, an inverted-interval update erasing a live
+  requirement, session copper untiered in the router, a finite-input overflow to `NaN`).
+  Goldens: `golden-electrical-2l` new (85 primitives, 26 violations / 7 codes, attributed);
+  every pre-existing golden byte-identical (census walked cause by cause, no delta). Files > 500
+  lines after S13: `checks/clearance-judge.ts` (1016), `rule-resolver.ts` (590), `drc-context.ts`
+  (≈ 1400) — split with the S12 / S12b set. Gates (2026-09-12): backend `bun test` 2891 pass / 22 known library + assistant fails / 8 skip
+  (2921); tsc 44 (repo root); Vitest 64 files 583 + 1 todo; gen + gen:contracts clean; worker smoke
+  byte-identical (census, 87 violations); e2e DRC + routing + live-parity 5 + 1 skip;
+  `package-lock.json` 034652c3; goldens areas 99c49eb3 · arcs cd6b067e · census f05ee74f · cutouts
+  43fbd513 · dfm 47573fd3 · electrical a9990112 (new) · holes c8ab6694 · pours ab245110 · rules
+  ed0705e8 · small 95fbb3dc (nine byte-identical to the S12b baseline); the S9 clearance oracle
+  byte-identical to `HEAD`.
+## Appendix — Session 0 amendments to the original program text
+
+The program above is the user's plan of 2026-09-06 with the following changes, each backed by the
+evidence in `00-ground-truth.md`:
+
+| # | Amendment | Evidence |
+|---|---|---|
+| A1 | Register evidence weaker than assumed: 7 of 19 `test.todo` bodies were placeholders. S0 wrote real specs for them. | ground-truth §1 |
+| A2 | B2-9 closed (via gate already uses `below()`); B5-LIVE-PADGEOMS closed (mechanism gone; residual per-cursor-move rebuild noted for S8/S9); B2-5 narrowed to the manufacturability half; B5-LIVE-ROT-PAD spec rewritten (old body passed for the wrong reason). | ground-truth §1 |
+| A3 | Stale invariant sources corrected (`designer/AGENTS.md`, hardening-skill references, OPEN_FINDINGS §6.3, `types.ts` comment). | ground-truth §2, §7 |
+| A4 | S1's mandate includes unifying six independent connectivity models, not only the ratsnest. | ground-truth §4 |
+| A5 | S6 must reconcile the three clearance-resolution copies (rule resolver, route obstacles, live DRC). | ground-truth §4 |
+| A6 | S8 owns the route-commit server-gate decision. | ground-truth §3 |
+| A7 | S1 runs before S2 but consumes only shared geometry kernels and lists them. | ground-truth §4 |
+| A8 | S3 split into S3a (contract + data model + consumers) and S3b (authoring tools) — user chose to include authoring tools in the program. | ground-truth §3 |
+| A9 | Session count is 20 (S0–S18 with S3a/S3b), not 16; `_to_delete/` and `electron/out/` excluded from greps; each Astra run needs user approval. | — |

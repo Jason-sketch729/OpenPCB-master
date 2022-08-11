@@ -1,0 +1,10 @@
+# Bun configuration
+
+[dev]
+reload = true
+
+[define]
+"NODE_ENV" = "\"development\""
+
+[test]
+timeout = 30000
