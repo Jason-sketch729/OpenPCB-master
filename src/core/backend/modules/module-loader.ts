@@ -1,0 +1,559 @@
+import { access } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import type {
+  ModuleRegistryItem,
+  ModuleRegistryResponse,
+  ResolvedModuleDependency,
+} from "../../contracts/modules/registry";
+import type { NormalizedModuleManifest } from "../../contracts/modules/manifest";
+import type { CoreBackendModuleContext } from "../../contracts/modules/backend-module";
+import { ModuleRouter } from "../router/module-router";
+import type { ModuleRouterRegistry } from "../router/module-registry";
+import { createModuleDb } from "../db/module-db-factory";
+import { createLogger } from "../logging/logger";
+import { MentionRegistry } from "../mentions";
+import { applyModuleMigrations } from "../migrations/module-migrator";
+import {
+  isCoreBackendModuleDefinition,
+  type CoreBackendModuleDefinition,
+} from "./backend-module";
+import { discoverModuleManifests } from "./manifest-discovery";
+import { RuntimeSdkRegistry } from "./sdk-registry";
+import { STATIC_MODULES, type StaticModuleExports } from "./static-modules";
+
+interface ModuleLoadRecord {
+  id: string;
+  label: string;
+  namespace: string;
+  version: string;
+  kind: NormalizedModuleManifest["kind"];
+  sidebar: NormalizedModuleManifest["sidebar"];
+  defaultPinned: boolean;
+  status: "pending" | "loaded" | "skipped" | "failed";
+  reason?: string;
+  dependencies: ResolvedModuleDependency[];
+}
+
+interface LoadedRuntimeModule {
+  manifest: NormalizedModuleManifest;
+  definition: CoreBackendModuleDefinition;
+  context: CoreBackendModuleContext;
+}
+
+export interface ModuleRuntimeDebugSnapshot {
+  loadedModules: string[];
+  modules: ModuleRegistryItem[];
+  sdkTokens: string[];
+}
+
+export interface ModuleRuntimeSnapshotProvider {
+  snapshot(): ModuleRegistryResponse;
+  debugSnapshot(): ModuleRuntimeDebugSnapshot;
+}
+
+export interface ModuleLoaderOptions {
+  moduleRegistry: ModuleRouterRegistry;
+  workspaceRoot?: string;
+  sdkRegistry?: RuntimeSdkRegistry;
+  staticModules?: ReadonlyMap<string, StaticModuleExports>;
+}
+
+const FALLBACK_SIDEBAR = {
+  label: "",
+  icon: "Box",
+  order: 999,
+} as const;
+
+const MODULE_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+interface ParsedSemver {
+  major: number;
+  minor: number;
+  patch: number;
+}
+
+function parseSemver(value: string): ParsedSemver | null {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  if (!match) {
+    return null;
+  }
+
+  const major = Number(match[1]);
+  const minor = Number(match[2]);
+  const patch = Number(match[3]);
+  if (
+    !Number.isInteger(major) ||
+    !Number.isInteger(minor) ||
+    !Number.isInteger(patch)
+  ) {
+    return null;
+  }
+  return { major, minor, patch };
+}
+
+function isVersionAtLeast(actual: string, minVersion: string): boolean {
+  const actualParsed = parseSemver(actual);
+  const minParsed = parseSemver(minVersion);
+  if (!actualParsed || !minParsed) {
+    return false;
+  }
+
+  if (actualParsed.major !== minParsed.major) {
+    return actualParsed.major > minParsed.major;
+  }
+  if (actualParsed.minor !== minParsed.minor) {
+    return actualParsed.minor > minParsed.minor;
+  }
+  return actualParsed.patch >= minParsed.patch;
+}
+
+function hasModulesDirectory(workspaceRoot: string): boolean {
+  return existsSync(path.join(workspaceRoot, "modules"));
+}
+
+function isPackaged(): boolean {
+  return process.env.NODE_ENV === "production";
+}
+
+function resolveWorkspaceRoot(options: ModuleLoaderOptions): string {
+  const explicit = options.workspaceRoot ?? process.env.OPENPCB_WORKSPACE_ROOT;
+  if (explicit) {
+    const resolved = path.resolve(explicit);
+    if (!hasModulesDirectory(resolved)) {
+      if (isPackaged()) {
+        throw new Error(
+          `Packaged runtime requires a valid OPENPCB_WORKSPACE_ROOT with a modules/ directory. Received: ${explicit}`,
+        );
+      }
+    }
+    return resolved;
+  }
+
+  if (isPackaged()) {
+    throw new Error(
+      "Packaged runtime requires OPENPCB_WORKSPACE_ROOT to be set explicitly.",
+    );
+  }
+
+  const candidates = [
+    path.resolve(MODULE_DIR, "../../.."),
+    path.resolve(process.cwd(), "src"),
+    process.cwd(),
+  ];
+
+  for (const candidate of candidates) {
+    if (hasModulesDirectory(candidate)) {
+      return candidate;
+    }
+  }
+
+  return candidates[0]!;
+}
+
+export class ModuleRuntime implements ModuleRuntimeSnapshotProvider {
+  private readonly moduleRegistry: ModuleRouterRegistry;
+
+  private readonly workspaceRoot: string;
+
+  private readonly sdkRegistry: RuntimeSdkRegistry;
+
+  private readonly staticModules: ReadonlyMap<string, StaticModuleExports>;
+
+  private readonly records = new Map<string, ModuleLoadRecord>();
+
+  private readonly loaded = new Map<string, LoadedRuntimeModule>();
+
+  private shutdownPromise: Promise<void> | undefined;
+
+  constructor(options: ModuleLoaderOptions) {
+    this.moduleRegistry = options.moduleRegistry;
+    this.workspaceRoot = resolveWorkspaceRoot(options);
+    this.sdkRegistry = options.sdkRegistry ?? new RuntimeSdkRegistry();
+    this.staticModules = options.staticModules ?? STATIC_MODULES;
+  }
+
+  /** Stop module admission before awaiting hooks; dependents stop before dependencies. */
+  shutdown(): Promise<void> {
+    this.shutdownPromise ??= this.deactivateLoaded();
+    return this.shutdownPromise;
+  }
+
+  private async deactivateLoaded(): Promise<void> {
+    const modules = this.shutdownOrder();
+    this.loaded.clear();
+    for (const module of modules)
+      this.moduleRegistry.unregister(module.manifest.id);
+    const errors: unknown[] = [];
+    for (const module of modules) {
+      try {
+        await module.definition.onDeactivate?.(module.context);
+      } catch (error) {
+        errors.push(error);
+      }
+    }
+    if (errors.length)
+      throw new AggregateError(errors, "Module shutdown failed");
+  }
+
+  private shutdownOrder(): LoadedRuntimeModule[] {
+    const ordered: LoadedRuntimeModule[] = [];
+    const visited = new Set<string>();
+    const visit = (module: LoadedRuntimeModule) => {
+      if (visited.has(module.manifest.id)) return;
+      visited.add(module.manifest.id);
+      for (const dependency of module.manifest.dependsOn) {
+        const loaded = this.loaded.get(dependency.id);
+        if (loaded) visit(loaded);
+      }
+      ordered.push(module);
+    };
+    for (const module of this.loaded.values()) visit(module);
+    return ordered.reverse();
+  }
+
+  getSdkRegistry(): RuntimeSdkRegistry {
+    return this.sdkRegistry;
+  }
+
+  async bootstrap(): Promise<void> {
+    if (this.shutdownPromise || this.loaded.size)
+      throw new Error("Module runtime cannot bootstrap twice");
+    // Core-infra singleton the module system depends on (library/knowledge
+    // register mention providers in onActivate). Idempotent; initializing at
+    // the bootstrap choke-point makes every ModuleRuntime construction path
+    // safe — prod (runtime.ts also inits, belt-and-braces) and tests alike.
+    MentionRegistry.init();
+    this.records.clear();
+    this.loaded.clear();
+
+    const discovered = await discoverModuleManifests(this.workspaceRoot);
+    const manifestById = new Map(
+      discovered.manifests.map((entry) => [entry.manifest.id, entry]),
+    );
+
+    for (const entry of discovered.manifests) {
+      this.records.set(entry.manifest.id, this.createRecord(entry.manifest));
+    }
+    for (const failure of discovered.failures) {
+      this.records.set(failure.moduleId, {
+        id: failure.moduleId,
+        label: failure.moduleId,
+        namespace: `invalid.${failure.moduleId}`,
+        version: "0.0.0",
+        kind: "space",
+        sidebar: { ...FALLBACK_SIDEBAR, label: failure.moduleId },
+        defaultPinned: false,
+        status: "failed",
+        reason: failure.reason,
+        dependencies: [],
+      });
+    }
+
+    const pending = new Set(manifestById.keys());
+
+    while (pending.size > 0) {
+      let progressed = false;
+
+      for (const moduleId of [...pending]) {
+        const discoveredManifest = manifestById.get(moduleId);
+        if (!discoveredManifest) {
+          pending.delete(moduleId);
+          continue;
+        }
+
+        const manifest = discoveredManifest.manifest;
+        const record = this.records.get(moduleId);
+        if (!record) {
+          pending.delete(moduleId);
+          continue;
+        }
+
+        if (!manifest.enabled) {
+          record.dependencies = this.resolveDependencies(manifest);
+          record.status = "skipped";
+          record.reason = "Disabled by manifest";
+          pending.delete(moduleId);
+          progressed = true;
+          continue;
+        }
+
+        if (manifest.availability === "dev" && isPackaged()) {
+          record.dependencies = this.resolveDependencies(manifest);
+          record.status = "skipped";
+          record.reason = "Unavailable in production build (availability: dev)";
+          pending.delete(moduleId);
+          progressed = true;
+          continue;
+        }
+
+        record.dependencies = this.resolveDependencies(manifest);
+        const blocking = record.dependencies.find(
+          (dep) =>
+            !dep.optional &&
+            ["missing", "failed", "skipped"].includes(dep.status),
+        );
+        if (blocking) {
+          record.status = "skipped";
+          record.reason = `Required dependency '${blocking.id}' is ${blocking.status}`;
+          pending.delete(moduleId);
+          progressed = true;
+          continue;
+        }
+
+        const waitingRequired = record.dependencies.some(
+          (dep) => !dep.optional && dep.status === "pending",
+        );
+        if (waitingRequired) {
+          continue;
+        }
+
+        try {
+          await this.loadSingleModule(discoveredManifest);
+          record.status = "loaded";
+          delete record.reason;
+        } catch (error) {
+          record.status = "failed";
+          record.reason =
+            error instanceof Error
+              ? error.message
+              : "Unknown module load error";
+        }
+
+        pending.delete(moduleId);
+        progressed = true;
+      }
+
+      if (!progressed) {
+        for (const moduleId of pending) {
+          const record = this.records.get(moduleId);
+          if (!record) {
+            continue;
+          }
+          record.dependencies = record.dependencies.map((dep) =>
+            dep.status === "pending"
+              ? {
+                  ...dep,
+                  status: "skipped",
+                }
+              : dep,
+          );
+          record.status = "skipped";
+          record.reason = "Dependency cycle or unresolved dependencies";
+        }
+        pending.clear();
+      }
+    }
+  }
+
+  snapshot(): ModuleRegistryResponse {
+    const modules: ModuleRegistryItem[] = [...this.records.values()]
+      .map((record) => ({
+        id: record.id,
+        label: record.label,
+        namespace: record.namespace,
+        version: record.version,
+        kind: record.kind,
+        sidebar: record.sidebar,
+        defaultPinned: record.defaultPinned,
+        status: record.status === "pending" ? "skipped" : record.status,
+        reason: record.reason,
+        dependencies: record.dependencies,
+      }))
+      .sort((left, right) => left.id.localeCompare(right.id));
+
+    return {
+      modules,
+      loadedModules: modules
+        .filter((item) => item.status === "loaded")
+        .map((item) => item.id),
+    };
+  }
+
+  debugSnapshot(): ModuleRuntimeDebugSnapshot {
+    const snapshot = this.snapshot();
+    return {
+      loadedModules: snapshot.loadedModules,
+      modules: snapshot.modules,
+      sdkTokens: this.sdkRegistry.listTokens(),
+    };
+  }
+
+  private createRecord(manifest: NormalizedModuleManifest): ModuleLoadRecord {
+    return {
+      id: manifest.id,
+      label: manifest.label,
+      namespace: manifest.namespace,
+      version: manifest.version,
+      kind: manifest.kind,
+      sidebar: manifest.sidebar,
+      defaultPinned: manifest.defaultPinned,
+      status: "pending",
+      dependencies: [],
+    };
+  }
+
+  private resolveDependencies(
+    manifest: NormalizedModuleManifest,
+  ): ResolvedModuleDependency[] {
+    return manifest.dependsOn.map((dep) => {
+      const record = this.records.get(dep.id);
+      if (!record) {
+        return {
+          ...dep,
+          optional: Boolean(dep.optional),
+          status: "missing",
+        };
+      }
+
+      const hasVersionMismatch =
+        record.status === "loaded" &&
+        typeof dep.minVersion === "string" &&
+        dep.minVersion.trim().length > 0 &&
+        !isVersionAtLeast(record.version, dep.minVersion);
+
+      if (hasVersionMismatch) {
+        return {
+          ...dep,
+          optional: Boolean(dep.optional),
+          status: "failed",
+        };
+      }
+
+      return {
+        ...dep,
+        optional: Boolean(dep.optional),
+        status: record.status,
+      };
+    });
+  }
+
+  private async loadSingleModule(discoveredManifest: {
+    manifest: NormalizedModuleManifest;
+    moduleDir: string;
+  }): Promise<void> {
+    const manifest = discoveredManifest.manifest;
+
+    // 1. Apply migrations BEFORE calling onActivate so the module's
+    //    schema is ready when it runs its first query.
+    const migrationsDir = path.join(
+      discoveredManifest.moduleDir,
+      "backend",
+      "migrations",
+    );
+    const migrationReport = await applyModuleMigrations(
+      manifest.id,
+      migrationsDir,
+    );
+    if (migrationReport.failed) {
+      throw new Error(
+        `Migration '${migrationReport.failed.name}' failed: ${migrationReport.failed.error}`,
+      );
+    }
+
+    // 2. Resolve the backend exports. Prefer the static registry (modules
+    //    compiled into the binary) so packaged builds do not depend on
+    //    `node_modules/` being shipped alongside the on-disk module sources.
+    //    Fall back to a dynamic filesystem import for unknown modules
+    //    (e.g. third-party plugins dropped into modules/ at dev time).
+    let moduleExports: Record<string, unknown>;
+    let moduleSource: string;
+    const staticExports = this.staticModules.get(manifest.id);
+    if (staticExports) {
+      moduleExports = staticExports as Record<string, unknown>;
+      moduleSource = `static:${manifest.id}`;
+    } else {
+      const modulePath = await this.resolveBackendEntryPath(
+        discoveredManifest.moduleDir,
+        manifest,
+      );
+      const moduleUrl = pathToFileURL(modulePath).toString();
+      moduleExports = (await import(moduleUrl)) as Record<string, unknown>;
+      moduleSource = modulePath;
+    }
+
+    const definitionCandidate =
+      moduleExports.definition ??
+      moduleExports.default ??
+      moduleExports.backendModule;
+
+    if (!isCoreBackendModuleDefinition(definitionCandidate)) {
+      throw new Error(
+        `Backend entry '${moduleSource}' does not export a ModuleDefinition (expected 'definition' or default export)`,
+      );
+    }
+
+    const definition = definitionCandidate as CoreBackendModuleDefinition;
+    if (definition.id !== manifest.id) {
+      throw new Error(
+        `Backend entry id '${definition.id}' does not match manifest id '${manifest.id}'`,
+      );
+    }
+
+    // 3. Build the ctx.
+    const logger = createLogger(manifest.id);
+    const db = createModuleDb(manifest.id);
+    const context: CoreBackendModuleContext = {
+      moduleId: manifest.id,
+      manifest,
+      sdk: this.sdkRegistry,
+      logger,
+      db,
+    };
+
+    if (migrationReport.applied.length > 0) {
+      logger.info("applied migrations", {
+        count: migrationReport.applied.length,
+        names: migrationReport.applied,
+      });
+    }
+
+    // A failed registration can still leave a fully initialized service behind.
+    try {
+      await definition.onActivate?.(context);
+      await definition.registerSdk?.(context);
+      const router = new ModuleRouter(manifest.id, definition.errorBoundary);
+      await definition.registerRoutes?.(router, context);
+      this.moduleRegistry.register(router);
+      this.loaded.set(manifest.id, { manifest, definition, context });
+    } catch (error) {
+      this.moduleRegistry.unregister(manifest.id);
+      try {
+        await definition.onDeactivate?.(context);
+      } catch (cleanupError) {
+        throw new AggregateError(
+          [error, cleanupError],
+          `Module '${manifest.id}' initialization and cleanup failed`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private async resolveBackendEntryPath(
+    moduleDir: string,
+    manifest: NormalizedModuleManifest,
+  ): Promise<string> {
+    const entry = manifest.runtime.backendEntry;
+    // Reject path traversal or absolute paths in the manifest entry
+    if (path.isAbsolute(entry) || entry.includes("..") || entry.includes("~")) {
+      throw new Error(
+        `Invalid backend entry '${entry}' for module '${manifest.id}': must be a relative path within the module directory`,
+      );
+    }
+    const candidate = path.resolve(moduleDir, entry);
+    if (!candidate.startsWith(`${path.resolve(moduleDir)}${path.sep}`)) {
+      throw new Error(
+        `Backend entry '${entry}' for module '${manifest.id}' escapes the module directory`,
+      );
+    }
+    try {
+      await access(candidate);
+      return candidate;
+    } catch {
+      throw new Error(`Backend entry not found: ${candidate}`);
+    }
+  }
+}

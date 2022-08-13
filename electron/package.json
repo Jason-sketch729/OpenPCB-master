@@ -1,0 +1,38 @@
+{
+  "name": "openpcb-electron",
+  "version": "0.1.1-beta",
+  "description": "OpenPCB desktop application",
+  "author": "OpenPCB",
+  "homepage": "https://github.com/OpenPCB-app/OpenPCB",
+  "license": "AGPL-3.0-or-later",
+  "private": true,
+  "main": "dist/main/index.js",
+  "scripts": {
+    "prebuild": "node ../scripts/check-siwc-distribution.mjs",
+    "build": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && tsup",
+    "build:watch": "tsup --watch",
+    "prestart": "node ../scripts/ensure-electron-native-deps.mjs",
+    "start": "electron .",
+    "package": "node ../scripts/check-agentkit-distribution.mjs && node ../scripts/ensure-electron-native-deps.mjs && npm run build && electron-builder --dir --config electron-builder.cjs",
+    "make": "node ../scripts/check-agentkit-distribution.mjs && node ../scripts/ensure-electron-native-deps.mjs && npm run build && electron-builder --config electron-builder.cjs --publish never",
+    "make:mac": "node ../scripts/check-agentkit-distribution.mjs && node ../scripts/ensure-electron-native-deps.mjs && npm run build && electron-builder --mac --config electron-builder.cjs --publish never",
+    "make:win": "node ../scripts/check-agentkit-distribution.mjs && node ../scripts/ensure-electron-native-deps.mjs && npm run build && electron-builder --win --config electron-builder.cjs --publish never",
+    "make:linux": "node ../scripts/check-agentkit-distribution.mjs && node ../scripts/ensure-electron-native-deps.mjs && npm run build && electron-builder --linux --config electron-builder.cjs --publish never"
+  },
+  "dependencies": {
+    "@sentry/electron": "^7.0.0",
+    "@sentry/node": "^10.53.1",
+    "better-sqlite3": "13.0.3",
+    "drizzle-orm": "^0.45.2",
+    "electron-log": "^5.4.4",
+    "electron-updater": "6.8.9",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "electron": "41.10.6",
+    "electron-builder": "26.15.0",
+    "tsup": "^8.4.0",
+    "typescript": "~5.8.3"
+  }
+}
