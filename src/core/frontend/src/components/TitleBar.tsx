@@ -1,0 +1,73 @@
+import * as React from "react";
+import { useRuntime } from "@/providers/RuntimeProvider";
+import { useTheme } from "@/providers/ThemeProvider";
+import { useWindowTitleStore } from "@/stores/window-title-store";
+
+// Keep in sync with TITLEBAR_HEIGHT in electron/src/main/index.ts and the
+// setTitleBarOverlay height, or the native Window Controls Overlay buttons
+// (Windows/Linux) misalign with this strip.
+const TITLEBAR_HEIGHT = 36;
+
+const isMac =
+  typeof navigator !== "undefined" &&
+  navigator.platform.toUpperCase().includes("MAC");
+
+// Mirrors index.css --surface-rail / --text-strong. Solid hex only — the
+// Window Controls Overlay rejects rgba() colors. Keyed on the resolved theme
+// mode rather than read from getComputedStyle, because this child effect fires
+// before ThemeProvider's .dark-class effect (React runs child effects first),
+// so computed styles would be stale on a theme switch.
+const OVERLAY: Record<
+  "light" | "dark",
+  { color: string; symbolColor: string }
+> = {
+  dark: { color: "#0f0f10", symbolColor: "#f5f5f5" },
+  light: { color: "#ececee", symbolColor: "#111114" },
+};
+
+/**
+ * Themed custom window title bar for the Electron desktop shell.
+ *
+ * Renders nothing in the browser (web) runtime. In Electron it draws a slim
+ * draggable strip matching the app theme; macOS keeps its native traffic
+ * lights (cleared by the left padding) and Windows/Linux keep the native
+ * Window Controls Overlay (drawn over the right edge by the OS).
+ */
+export function TitleBar(): React.ReactElement | null {
+  const { runtime } = useRuntime();
+  const { mode } = useTheme();
+  const subtitle = useWindowTitleStore((state) => state.subtitle);
+
+  React.useEffect(() => {
+    if (isMac) return; // native traffic lights aren't recolorable this way
+    void window.electronAPI?.window?.setOverlayTheme(OVERLAY[mode]);
+  }, [mode]);
+
+  // Mirror the same context onto the document title — the web runtime has no
+  // custom title bar, and Electron's taskbar/window list reads it too.
+  React.useEffect(() => {
+    document.title = subtitle ? `${subtitle} — OpenPCB` : "OpenPCB";
+  }, [subtitle]);
+
+  if (runtime !== "electron") return null;
+
+  return (
+    <div
+      role="presentation"
+      aria-hidden="true"
+      style={
+        {
+          height: TITLEBAR_HEIGHT,
+          WebkitAppRegion: "drag",
+          // macOS: clear the native traffic lights on the left.
+          paddingLeft: isMac ? 80 : 8,
+        } as React.CSSProperties
+      }
+      className="flex shrink-0 select-none items-center justify-center border-b border-border bg-surface-rail"
+    >
+      <span className="truncate px-2 text-xs font-medium tracking-wide text-text-tertiary">
+        {subtitle ? `OpenPCB — ${subtitle}` : "OpenPCB"}
+      </span>
+    </div>
+  );
+}

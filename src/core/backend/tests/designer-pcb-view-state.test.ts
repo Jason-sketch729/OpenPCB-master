@@ -1,0 +1,1326 @@
+import { describe, expect, test } from "bun:test";
+import os from "node:os";
+import path from "node:path";
+import type {
+  DesignerCommandEnvelope,
+  DesignerSDK,
+  PcbViewState,
+} from "../../../sdks";
+import { MODULE_SDK_TOKENS } from "../../../sdks";
+import { runDrc } from "../../../modules/designer/backend/drc/drc-engine";
+import { resetSharedSqliteForTesting } from "../db/sqlite-client";
+import { DiagnosticsStore } from "../diagnostics/diagnostics-store";
+import { createHttpServer } from "../http/create-http-server";
+import { ModuleRuntime } from "../modules/module-loader";
+import { ModuleRouterRegistry } from "../router/module-registry";
+import { MentionRegistry } from "../mentions";
+import { dispatchOk } from "./helpers/designer-runtime";
+
+const SESSION = "designer-pcb-view-state";
+
+async function seedActiveNets(sdk: DesignerSDK, designId: string, count: number): Promise<string[]> {
+  for (let index = 0; index < count; index++) await dispatchOk(sdk, designId, {
+    type: "upsert_label", text: `Fixture net ${index}`, positionNm: { x: index * 10_000_000, y: 100_000_000 },
+  });
+  const projection = (await sdk.getSchematicProjection(designId))!;
+  expect(projection.nets).toHaveLength(count);
+  return projection.nets.map((net) => net.id);
+}
+
+function isolateTestDb(testLabel: string): void {
+  resetSharedSqliteForTesting();
+  process.env.OPENPCB_DB_PATH = path.join(
+    os.tmpdir(),
+    `${testLabel}-${Date.now()}-${crypto.randomUUID()}.sqlite`,
+  );
+}
+
+async function createRuntime() {
+  // The library module registers @mention providers on activate; the real boot
+  // (runtime.ts) calls this before bootstrap. Idempotent — safe per test.
+  MentionRegistry.init();
+  const repoRoot = path.resolve(import.meta.dir, "../../..");
+  const moduleRegistry = new ModuleRouterRegistry();
+  const moduleRuntime = new ModuleRuntime({
+    moduleRegistry,
+    workspaceRoot: repoRoot,
+  });
+  await moduleRuntime.bootstrap();
+  const server = createHttpServer({
+    diagnosticsStore: new DiagnosticsStore(),
+    moduleRegistry,
+    moduleRuntime,
+  });
+  return { moduleRuntime, server };
+}
+
+function envelope(
+  designId: string,
+  commandId: string,
+  baseRevision: number | null,
+  command: DesignerCommandEnvelope["command"],
+): DesignerCommandEnvelope {
+  return {
+    commandId,
+    sessionId: SESSION,
+    aggregateId: designId,
+    baseRevision,
+    issuedAt: Date.now(),
+    command,
+  };
+}
+
+async function createDesignerSdk(testLabel: string): Promise<{
+  sdk: DesignerSDK;
+  designId: string;
+}> {
+  isolateTestDb(testLabel);
+  const { moduleRuntime } = await createRuntime();
+  const sdk = moduleRuntime
+    .getSdkRegistry()
+    .resolve<DesignerSDK>(MODULE_SDK_TOKENS.DESIGNER);
+  const design = await sdk.createDesign({ name: testLabel });
+  return { sdk, designId: design.id };
+}
+
+// Variant that keeps the HTTP server so a command can be dispatched through the
+// REAL route (parseCommandEnvelope / parsePcbSetDesignRulesCommand) — the
+// in-process SDK bypasses that parser, where new command fields get dropped.
+async function createDesignerHttp(testLabel: string): Promise<{
+  sdk: DesignerSDK;
+  server: Awaited<ReturnType<typeof createRuntime>>["server"];
+  designId: string;
+}> {
+  isolateTestDb(testLabel);
+  const { moduleRuntime, server } = await createRuntime();
+  const sdk = moduleRuntime
+    .getSdkRegistry()
+    .resolve<DesignerSDK>(MODULE_SDK_TOKENS.DESIGNER);
+  const design = await sdk.createDesign({ name: testLabel });
+  return { sdk, server, designId: design.id };
+}
+
+async function postCommand(
+  server: Awaited<ReturnType<typeof createRuntime>>["server"],
+  designId: string,
+  baseRevision: number | null,
+  command: DesignerCommandEnvelope["command"],
+): Promise<Response> {
+  return server.fetch(
+    new Request(
+      `http://localhost/api/modules/designer/designs/${designId}/commands`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          envelope(designId, crypto.randomUUID(), baseRevision, command),
+        ),
+      },
+    ),
+  );
+}
+
+describe("designer PCB view-state persistence", () => {
+  test("new boards start with default viewState", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-default");
+    const projection = await sdk.getPcbProjection(designId);
+    const viewState = projection?.board.viewState;
+
+    expect(viewState).toBeDefined();
+    expect(viewState?.viewSide).toBe("top");
+    expect(viewState?.displayMode).toBe("normal");
+    expect(viewState?.layerPreset).toBe("custom");
+    expect(viewState?.perLayerOpacity).toEqual({});
+    expect(viewState?.ratsnestVisible).toBe(true);
+  });
+
+  test("pcb_set_view_state persists a partial patch and round-trips through projection", async () => {
+    const { sdk, designId } = await createDesignerSdk(
+      "pcb-view-state-roundtrip",
+    );
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-roundtrip", 0, {
+        type: "pcb_set_view_state",
+        patch: {
+          viewSide: "bottom",
+          displayMode: "dim",
+          layerPreset: "top-side",
+          ratsnestVisible: false,
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    const viewState = projection?.board.viewState;
+    expect(viewState?.viewSide).toBe("bottom");
+    expect(viewState?.displayMode).toBe("dim");
+    expect(viewState?.layerPreset).toBe("top-side");
+    expect(viewState?.ratsnestVisible).toBe(false);
+  });
+
+  test("DRC waivers + ignored rule-classes persist through pcb_set_view_state", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-drc");
+    const v2Id = "TRACE_TO_TRACE_CLEARANCE-v2-0123456789abcdef";
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-drc", 0, {
+        type: "pcb_set_view_state",
+        patch: {
+          // A v1-format id alongside a v2 one: the v1 id cannot be mapped
+          // forward (it omitted the layer and the location), so it is PRUNED
+          // on patch and on read (rule-semantics contract §8, §12 item 9).
+          drcWaivedViolationIds: [v2Id, "TRACE_TO_TRACE_CLEARANCE-abc123"],
+          // includes a bogus rule-class that must be filtered on persist
+          drcIgnoredRuleClasses: ["manufacturability", "bogus" as never],
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    const viewState = projection?.board.viewState;
+    expect(viewState?.drcWaivedViolationIds).toEqual([v2Id]);
+    expect(viewState?.drcIgnoredRuleClasses).toEqual(["manufacturability"]);
+  });
+
+  // The store used to know only five of the eight DrcRuleClass values, so a
+  // persisted `dfm` / `electrical` / `signal-integrity` ignore was dropped on
+  // every read and every patch (S7 D11).
+  test("every rule class survives read + patch and suppresses its codes", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-classes");
+    const ignored = ["dfm", "electrical", "signal-integrity"] as const;
+    const set = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-classes", 0, {
+        type: "pcb_set_view_state",
+        patch: { drcIgnoredRuleClasses: [...ignored] },
+      }),
+    );
+    expect(set.ok).toBe(true);
+    const afterSet = await sdk.getPcbProjection(designId);
+    expect(afterSet?.board.viewState?.drcIgnoredRuleClasses).toEqual([
+      ...ignored,
+    ]);
+
+    // A patch that does not mention them must keep them (read path too).
+    const patched = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-classes-2", afterSet?.revision ?? null, {
+        type: "pcb_set_view_state",
+        patch: { ratsnestVisible: false },
+      }),
+    );
+    expect(patched.ok).toBe(true);
+
+    const [netId] = await seedActiveNets(sdk, designId, 1);
+    // A lone trace is dangling at both ends — a `dfm` code, now suppressed.
+    const rev = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const added = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-classes-trace", rev, {
+        type: "pcb_add_trace",
+        layer: "F.Cu",
+        pointsNm: [
+          { x: 0, y: 0 },
+          { x: 1_000_000, y: 0 },
+        ],
+        widthMm: 0.25,
+        netId: netId!,
+        netClassId: "default",
+        segmentMode: "manhattan-90",
+      }),
+    );
+    expect(added.ok).toBe(true);
+    const proj = (await sdk.getPcbProjection(designId))!;
+    expect(proj.board.viewState?.drcIgnoredRuleClasses).toEqual([...ignored]);
+    expect(
+      runDrc(proj).violations.some((v) => v.code === "TRACK_DANGLING"),
+    ).toBe(false);
+    // Control: the same board reports it once the class is no longer ignored.
+    expect(
+      runDrc(proj, { ignoredRuleClasses: [] }).violations.some(
+        (v) => v.code === "TRACK_DANGLING",
+      ),
+    ).toBe(true);
+  });
+
+  test("autoLayoutConfig round-trips through pcb_set_view_state and is absent on new rows", async () => {
+    const { sdk, designId } = await createDesignerSdk(
+      "pcb-view-state-autolayout",
+    );
+    // New rows carry no persisted config (frontend seeds from its default).
+    const fresh = await sdk.getPcbProjection(designId);
+    expect(fresh?.board.viewState?.autoLayoutConfig).toBeUndefined();
+
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-autolayout", 0, {
+        type: "pcb_set_view_state",
+        patch: {
+          autoLayoutConfig: {
+            runPlace: true,
+            runRoute: false,
+            preset: "custom",
+            effort: "quality",
+            place: {
+              allowRotate: false,
+              allowFlip: true,
+              moveConnectors: true,
+              respectExistingTraces: false,
+              targetUtilization: 0.85,
+            },
+            route: {
+              geometryMode: "manhattan-90",
+              allowVias: false,
+              maxViasPerNet: 3,
+              serializePours: "auto",
+            },
+          },
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    const cfg = projection?.board.viewState?.autoLayoutConfig;
+    expect(cfg).toBeDefined();
+    expect(cfg?.runPlace).toBe(true);
+    expect(cfg?.runRoute).toBe(false);
+    expect(cfg?.preset).toBe("custom");
+    expect(cfg?.effort).toBe("quality");
+    expect(cfg?.place.allowRotate).toBe(false);
+    expect(cfg?.place.moveConnectors).toBe(true);
+    expect(cfg?.place.targetUtilization).toBe(0.85);
+    expect(cfg?.route.geometryMode).toBe("manhattan-90");
+    expect(cfg?.route.allowVias).toBe(false);
+    expect(cfg?.route.maxViasPerNet).toBe(3);
+    expect(cfg?.route.serializePours).toBe("auto");
+  });
+
+  test("pcb_set_design_rules persists rules, net classes, thickness through reload", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-design-rules");
+    const baseProj = await sdk.getPcbProjection(designId);
+    const base = baseProj!.board.designRules;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules", 0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance, traceToTraceMm: 0.5 },
+          minimums: { ...base.minimums, holeToHoleMm: 0.4 },
+        },
+        netClasses: baseProj!.board.netClasses.map((c) => ({
+          ...c,
+          clearanceMm: 0.6,
+          diffPairGapMm: 0.15,
+        })),
+        boardThicknessMm: 2.0,
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    // Reload from the DB — exercises parseBoardSettings (previously dropped these).
+    const proj = await sdk.getPcbProjection(designId);
+    expect(proj?.board.designRules.clearance.traceToTraceMm).toBe(0.5);
+    expect(proj?.board.designRules.minimums.holeToHoleMm).toBe(0.4);
+    expect(proj?.board.boardThicknessMm).toBe(2.0);
+    expect(proj?.board.netClasses[0]?.clearanceMm).toBe(0.6);
+    expect(proj?.board.netClasses[0]?.diffPairGapMm).toBe(0.15);
+  });
+
+  test("diff-pair rows survive save/reload, couplingMaxGapMm included", async () => {
+    // SI contract 14 §4.2: the coupling window is a stored, per-pair field. A
+    // dropped one silently falls back to `4 · gap + 0.1`, which is a different
+    // rule than the one the user wrote. An omitted window retains its default;
+    // explicitly invalid values are refused at the command boundary.
+    const { sdk, designId } = await createDesignerSdk("pcb-diff-pairs");
+    const [p, n, a, b] = await seedActiveNets(sdk, designId, 4);
+    const revision = (await sdk.getPcbProjection(designId))!.revision;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-diff-pairs", revision, {
+        type: "pcb_set_design_rules",
+        diffPairs: [
+          {
+            id: "dp1",
+            name: "USB",
+            pNetId: p!,
+            nNetId: n!,
+            gapMm: 0.15,
+            gapTolMm: 0.02,
+            maxUncoupledMm: 4,
+            maxSkewMm: 0.25,
+            couplingMaxGapMm: 1.25,
+          },
+          { id: "dp2", name: "CLK", pNetId: a!, nNetId: b! },
+        ],
+      } as never),
+    );
+    expect(result.ok).toBe(true);
+
+    const pairs = (await sdk.getPcbProjection(designId))?.board.diffPairs;
+    expect(pairs?.[0]?.couplingMaxGapMm).toBe(1.25);
+    expect(pairs?.[0]?.gapTolMm).toBe(0.02);
+    expect(pairs?.[0]?.maxUncoupledMm).toBe(4);
+    expect(pairs?.[0]?.maxSkewMm).toBe(0.25);
+    expect(pairs?.[1]?.couplingMaxGapMm).toBeUndefined();
+  });
+
+  test("new DRC/electrical fields survive save/reload (review blocker)", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-design-rules-new");
+    const baseProj = await sdk.getPcbProjection(designId);
+    const base = baseProj!.board.designRules;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-new", 0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance, holeToBoardEdgeMm: 0.35 },
+          minimums: { ...base.minimums, clearanceMm: 0.15 },
+          electrical: { tempRiseC: 20, copperWeightOz: 2 },
+        },
+        netClasses: baseProj!.board.netClasses.map((c) => ({
+          ...c,
+          voltageV: 400,
+          currentA: 3,
+        })),
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const proj = await sdk.getPcbProjection(designId);
+    // These were silently stripped by parseDesignRules/parseNetClass before the
+    // fix, making the P5 hole-edge, P6 floor, and P10 electrical checks inert.
+    expect(proj?.board.designRules.clearance.holeToBoardEdgeMm).toBe(0.35);
+    expect(proj?.board.designRules.minimums.clearanceMm).toBe(0.15);
+    expect(proj?.board.designRules.electrical?.tempRiseC).toBe(20);
+    expect(proj?.board.designRules.electrical?.copperWeightOz).toBe(2);
+    expect(proj?.board.netClasses[0]?.voltageV).toBe(400);
+    expect(proj?.board.netClasses[0]?.currentA).toBe(3);
+  });
+
+  test("the S13 electrical fields survive save/reload, and the bad ones drop", async () => {
+    // Electrical contract 13 §2: a voltage INTERVAL is both keys or neither and
+    // never inverted; a temperature rise or copper weight is persisted only
+    // when finite and strictly positive; `outerConductors` only as one of its
+    // two strings.
+    const { sdk, designId } = await createDesignerSdk("pcb-design-rules-s13");
+    const baseProj = await sdk.getPcbProjection(designId);
+    const base = baseProj!.board.designRules;
+    const classes = baseProj!.board.netClasses;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-s13", 0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          electrical: {
+            tempRiseC: 20,
+            copperWeightOz: 2,
+            innerCopperWeightOz: 1,
+            outerConductors: "coated",
+          },
+        } as never,
+        netClasses: [
+          { ...classes[0]!, voltageMinV: -300, voltageMaxV: 300 },
+          // INVERTED, but both endpoints are finite numbers: persisted as
+          // given, so the resolver can report it. Dropping it here would take
+          // the requirement and the `DRC_RULE_INVALID` row with it.
+          { ...classes[1]!, voltageV: 12, voltageMinV: 5, voltageMaxV: -5 },
+          // A lone endpoint is not an interval, and this class stored none.
+          { ...classes[2]!, voltageMaxV: 48 },
+        ] as never,
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const proj = await sdk.getPcbProjection(designId);
+    const rules = proj?.board.designRules;
+    expect(rules?.electrical?.innerCopperWeightOz).toBe(1);
+    expect(rules?.electrical?.outerConductors).toBe("coated");
+    const reloaded = proj!.board.netClasses;
+    expect(reloaded[0]?.voltageMinV).toBe(-300);
+    expect(reloaded[0]?.voltageMaxV).toBe(300);
+    expect(reloaded[1]?.voltageMinV).toBe(5);
+    expect(reloaded[1]?.voltageMaxV).toBe(-5);
+    expect(reloaded[1]?.voltageV).toBe(12);
+    expect(reloaded[2]?.voltageMaxV).toBeUndefined();
+    expect(reloaded[2]?.voltageMinV).toBeUndefined();
+  });
+
+  test("a rejected currentA write keeps the stored rating; null clears it", async () => {
+    // Electrical contract 13 §5, the `voltageV` rule applied to the current:
+    // dropping a malformed rating reads as "this class declares no current",
+    // which is a silent PASS for every trace on it.
+    const { sdk, designId } = await createDesignerSdk("pcb-net-class-current");
+    const classes = (await sdk.getPcbProjection(designId))!.board.netClasses;
+    const send = async (commandId: string, currentA: unknown) => {
+      const rev = (await sdk.getPcbProjection(designId))?.revision ?? null;
+      const res = await sdk.dispatchCommand(
+        designId,
+        envelope(designId, commandId, rev, {
+          type: "pcb_set_design_rules",
+          netClasses: classes.map((c, i) =>
+            i === 1 ? { ...c, currentA } : c,
+          ) as never,
+        }),
+      );
+      expect(res.ok).toBe(true);
+      return (await sdk.getPcbProjection(designId))!.board.netClasses[1]!;
+    };
+
+    expect((await send("cmd-cur-seed", 3)).currentA).toBe(3);
+    // Declared but not a number: a rejected write, not a relaxation.
+    expect((await send("cmd-cur-bad", "x")).currentA).toBe(3);
+    // A finite NON-POSITIVE value persists as given — the resolver reports it.
+    expect((await send("cmd-cur-zero", 0)).currentA).toBe(0);
+    // An explicit `null` still clears the rating.
+    expect((await send("cmd-cur-clear", null)).currentA).toBeUndefined();
+  });
+
+  test("inverting a declared interval REPORTS it; it never silently passes", async () => {
+    // Astra run 2, executed end to end: a class at [−300, 300] V holds a live
+    // 1.25 mm `CREEPAGE_DISTANCE` against an undeclared neighbour. Inverting it
+    // to [300, −300] used to make BOTH endpoints vanish in the parser — the
+    // requirement AND the row that would have explained it. Contract 13 §2:
+    // malformed input is reported, never dropped.
+    const { sdk, designId } = await createDesignerSdk("pcb-net-class-inverted");
+    const [hvNetId, sigNetId] = await seedActiveNets(sdk, designId, 2);
+    const baseProj = await sdk.getPcbProjection(designId);
+    const classes = baseProj!.board.netClasses;
+    // NOT the default class: `sig` below resolves to that one, and two distinct
+    // nets of ONE interval class would be judged at Δ = 600 V (Astra run 1 #1),
+    // which is a different band and a different test.
+    const hvIndex = 1;
+    const hv = classes[hvIndex]!.id;
+
+    const declare = async (
+      commandId: string,
+      voltageMinV: number,
+      voltageMaxV: number,
+    ) => {
+      const rev = (await sdk.getPcbProjection(designId))?.revision ?? null;
+      const res = await sdk.dispatchCommand(
+        designId,
+        envelope(designId, commandId, rev, {
+          type: "pcb_set_design_rules",
+          netClasses: classes.map((c, i) =>
+            i === hvIndex ? { ...c, voltageMinV, voltageMaxV } : c,
+          ) as never,
+          perNetClassAssignments: { [hvNetId!]: hv },
+        }),
+      );
+      expect(res.ok).toBe(true);
+      return (await sdk.getPcbProjection(designId))!.board;
+    };
+
+    /** The stored board, judged against two traces 0.5 mm apart on F.Cu. */
+    const report = (board: NonNullable<typeof baseProj>["board"]) =>
+      runDrc({
+        ...baseProj!,
+        board,
+        netNames: { [hvNetId!]: "HV_RAIL", [sigNetId!]: "SIG" },
+        traces: [
+          {
+            id: "t_hv",
+            netId: hvNetId!,
+            netClassId: hv,
+            layer: "F.Cu",
+            widthMm: 0.2,
+            pointsNm: [
+              { x: 0, y: 0 },
+              { x: 10_000_000, y: 0 },
+            ],
+            segmentMode: "manhattan-45",
+          },
+          {
+            id: "t_sig",
+            netId: sigNetId!,
+            netClassId: "default",
+            layer: "F.Cu",
+            widthMm: 0.2,
+            pointsNm: [
+              { x: 0, y: 700_000 },
+              { x: 10_000_000, y: 700_000 },
+            ],
+            segmentMode: "manhattan-45",
+          },
+        ],
+      } as never);
+
+    const declared = report(await declare("cmd-nc-ok", -300, 300));
+    const creepage = declared.violations.filter(
+      (v) => v.code === "CREEPAGE_DISTANCE",
+    );
+    expect(creepage).toHaveLength(1);
+    expect(creepage[0]!.requiredMm).toBeCloseTo(1.25, 9);
+    expect(
+      declared.violations.filter((v) => v.code === "DRC_RULE_INVALID"),
+    ).toHaveLength(0);
+
+    const inverted = report(await declare("cmd-nc-bad", 300, -300));
+    // The endpoints SURVIVED the round trip …
+    const stored = (await sdk.getPcbProjection(designId))!.board.netClasses[
+      hvIndex
+    ]!;
+    expect(stored.voltageMinV).toBe(300);
+    expect(stored.voltageMaxV).toBe(-300);
+    // … so the resolver can refuse them out loud: an ERROR row, and the
+    // constituent withheld rather than quietly resolved to 0 V.
+    const invalid = inverted.violations.filter(
+      (v) => v.code === "DRC_RULE_INVALID",
+    );
+    expect(invalid).toHaveLength(1);
+    expect(invalid[0]!.severity).toBe("error");
+    expect(invalid[0]!.message).toContain("voltageMinV");
+    expect(
+      inverted.violations.filter((v) => v.code === "CREEPAGE_DISTANCE"),
+    ).toHaveLength(0);
+  });
+
+  test("a non-positive rise or weight, and a bogus coating, are not persisted", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-design-rules-s13-bad");
+    const baseProj = await sdk.getPcbProjection(designId);
+    const base = baseProj!.board.designRules;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-s13-bad", 0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          electrical: {
+            tempRiseC: 0,
+            copperWeightOz: -1,
+            outerConductors: "lacquered",
+          },
+        } as never,
+      }),
+    );
+    expect(result.ok).toBe(true);
+    const rules = (await sdk.getPcbProjection(designId))?.board.designRules;
+    // Every key refused ⇒ the sub-object itself is omitted, exactly as the S12
+    // DFM blocks behave.
+    expect(rules?.electrical).toBeUndefined();
+
+    // …but a rejected key on a board that already STORED one keeps the stored
+    // value. Dropping it would fall back to the reader's 10 °C / 1 oz defaults,
+    // which are LOOSER than a stored 5 °C — a malformed write must not relax
+    // the width check.
+    const rev1 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-s13-seed", rev1, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          electrical: { tempRiseC: 5, copperWeightOz: 2 },
+        } as never,
+      }),
+    );
+    const rev2 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const rejected = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-s13-reject", rev2, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          electrical: { tempRiseC: 0, copperWeightOz: 2 },
+        } as never,
+      }),
+    );
+    expect(rejected.ok).toBe(true);
+    const kept = (await sdk.getPcbProjection(designId))?.board.designRules;
+    expect(kept?.electrical?.tempRiseC).toBe(5);
+    expect(kept?.electrical?.copperWeightOz).toBe(2);
+
+    // An explicit `null` still CLEARS the whole block.
+    const rev3 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-s13-clear", rev3, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          electrical: null,
+        } as never,
+      }),
+    );
+    expect(
+      (await sdk.getPcbProjection(designId))?.board.designRules.electrical,
+    ).toBeUndefined();
+  });
+
+  test("the S12 DFM rule sub-objects survive save/reload", async () => {
+    // DFM contract 11 §6. `parseDesignRules` reads each key with the `optNum`
+    // semantics and OMITS a sub-object with no keys, so a board that never
+    // stored one is not retroactively given an empty row.
+    const { sdk, designId } = await createDesignerSdk("pcb-design-rules-dfm");
+    const baseProj = await sdk.getPcbProjection(designId);
+    const base = baseProj!.board.designRules;
+    expect(base.silkscreen).toBeUndefined();
+    expect(base.solderMask).toBeUndefined();
+    expect(base.dfm).toBeUndefined();
+    // The S12b board-material rule joins the same suite (12 §5.2).
+    expect(base.outline).toBeUndefined();
+
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-dfm", 0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...base.clearance },
+          minimums: { ...base.minimums },
+          // All seven fields of the three sub-objects, not a sample of them.
+          silkscreen: {
+            silkToMaskClearanceMm: 0.05,
+            silkToBoardEdgeMm: 0.2,
+          },
+          solderMask: { minBridgeMm: 0.12 },
+          dfm: {
+            sliverWidthMm: 0.08,
+            sliverMinLengthMm: 0.16,
+            acuteAngleDeg: 45,
+            courtyardFallbackMm: 0.4,
+          },
+          outline: { minWebMm: 1 },
+        },
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const proj = await sdk.getPcbProjection(designId);
+    const rules = proj!.board.designRules;
+    expect(rules.silkscreen).toEqual({
+      silkToMaskClearanceMm: 0.05,
+      silkToBoardEdgeMm: 0.2,
+    });
+    expect(rules.solderMask).toEqual({ minBridgeMm: 0.12 });
+    expect(rules.dfm).toEqual({
+      sliverWidthMm: 0.08,
+      sliverMinLengthMm: 0.16,
+      acuteAngleDeg: 45,
+      courtyardFallbackMm: 0.4,
+    });
+    expect(rules.outline).toEqual({ minWebMm: 1 });
+
+    // An UPDATE that names none of them keeps every stored value (§12 item 6).
+    const second = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-dfm-2", proj!.revision, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...rules.clearance, traceToTraceMm: 0.3 },
+          minimums: { ...rules.minimums },
+        },
+      }),
+    );
+    expect(second.ok).toBe(true);
+    const kept = (await sdk.getPcbProjection(designId))!.board.designRules;
+    expect(kept.clearance.traceToTraceMm).toBe(0.3);
+    expect(kept.silkscreen).toEqual({
+      silkToMaskClearanceMm: 0.05,
+      silkToBoardEdgeMm: 0.2,
+    });
+    expect(kept.dfm).toEqual({
+      sliverWidthMm: 0.08,
+      sliverMinLengthMm: 0.16,
+      acuteAngleDeg: 45,
+      courtyardFallbackMm: 0.4,
+    });
+    expect(kept.outline).toEqual({ minWebMm: 1 });
+
+    // An explicit null clears one key and leaves the rest of the row.
+    const third = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-dfm-3", kept ? 2 : 2, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: { ...kept.clearance },
+          minimums: { ...kept.minimums },
+          dfm: { acuteAngleDeg: null },
+          outline: { minWebMm: null },
+        },
+      } as never),
+    );
+    expect(third.ok).toBe(true);
+    const cleared = (await sdk.getPcbProjection(designId))!.board.designRules;
+    expect(cleared.dfm).toEqual({
+      sliverWidthMm: 0.08,
+      sliverMinLengthMm: 0.16,
+      courtyardFallbackMm: 0.4,
+    });
+    // The row's only key cleared ⇒ the sub-object is OMITTED, not left empty.
+    expect(cleared.outline).toBeUndefined();
+  });
+
+  test("the S12 DFM rule sub-objects survive the real HTTP route", async () => {
+    // The in-process SDK path above shares a process with the store; this one
+    // goes through the module router's own JSON parsing, which is where a new
+    // command field is silently dropped when its parser does not carry it
+    // (designer command HTTP parser gotcha).
+    isolateTestDb("pcb-design-rules-dfm-http");
+    const { moduleRuntime, server } = await createRuntime();
+    const sdk = moduleRuntime
+      .getSdkRegistry()
+      .resolve<DesignerSDK>(MODULE_SDK_TOKENS.DESIGNER);
+    const design = await sdk.createDesign({ name: "dfm rules over http" });
+    const base = `http://localhost/api/modules/designer/designs/${design.id}`;
+
+    const post = await server.fetch(
+      new Request(`${base}/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(
+          envelope(design.id, crypto.randomUUID(), 0, {
+            type: "pcb_set_design_rules",
+            designRules: {
+              silkscreen: {
+                silkToMaskClearanceMm: 0.05,
+                silkToBoardEdgeMm: 0.25,
+              },
+              solderMask: { minBridgeMm: 0.11 },
+              dfm: {
+                sliverWidthMm: 0.09,
+                sliverMinLengthMm: 0.18,
+                acuteAngleDeg: 60,
+                courtyardFallbackMm: 0.3,
+              },
+              outline: { minWebMm: 0.8 },
+            },
+          } as never),
+        ),
+      }),
+    );
+    expect(post.status).toBe(200);
+
+    const get = await server.fetch(new Request(`${base}/projection/pcb`));
+    expect(get.status).toBe(200);
+    const body = (await get.json()) as {
+      data?: { projection?: { board: { designRules: Record<string, unknown> } } };
+    };
+    const rules = body.data?.projection?.board.designRules;
+    expect(rules?.silkscreen).toEqual({
+      silkToMaskClearanceMm: 0.05,
+      silkToBoardEdgeMm: 0.25,
+    });
+    expect(rules?.solderMask).toEqual({ minBridgeMm: 0.11 });
+    expect(rules?.dfm).toEqual({
+      sliverWidthMm: 0.09,
+      sliverMinLengthMm: 0.18,
+      acuteAngleDeg: 60,
+      courtyardFallbackMm: 0.3,
+    });
+    expect(rules?.outline).toEqual({ minWebMm: 0.8 });
+  });
+
+  test("pcb_set_view_state does not create undo history entries", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-no-undo");
+    const before = await sdk.getHistory(designId, SESSION);
+    expect(before.undoDepth).toBe(0);
+
+    const viewOnly = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-view-only", 0, {
+        type: "pcb_set_view_state",
+        patch: { viewSide: "bottom", displayMode: "solo" },
+      }),
+    );
+    expect(viewOnly.ok).toBe(true);
+
+    const after = await sdk.getHistory(designId, SESSION);
+    expect(after.canUndo).toBe(false);
+    expect(after.undoDepth).toBe(0);
+
+    const undo = await sdk.undo(designId, SESSION);
+    expect(undo.ok).toBe(false);
+    if (!undo.ok) expect(undo.code).toBe("HISTORY_EMPTY");
+    const projection = await sdk.getPcbProjection(designId);
+    expect(projection?.board.viewState?.viewSide).toBe("bottom");
+  });
+
+  test("partial patches merge displayMode and viewSide across commands", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-merge");
+    const first = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-merge-display", 0, {
+        type: "pcb_set_view_state",
+        patch: { displayMode: "solo" },
+      }),
+    );
+    expect(first.ok).toBe(true);
+
+    const second = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-merge-side", 1, {
+        type: "pcb_set_view_state",
+        patch: { viewSide: "bottom" },
+      }),
+    );
+    expect(second.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    expect(projection?.board.viewState?.displayMode).toBe("solo");
+    expect(projection?.board.viewState?.viewSide).toBe("bottom");
+  });
+
+  test("perLayerOpacity values outside 0..1 are clamped on read", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-opacity");
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-opacity", 0, {
+        type: "pcb_set_view_state",
+        patch: { perLayerOpacity: { "F.Cu": -0.25, "B.Cu": 1.4, Drill: 0.55 } },
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    expect(projection?.board.viewState?.perLayerOpacity).toEqual({
+      "F.Cu": 0,
+      "B.Cu": 1,
+      Drill: 0.55,
+    });
+  });
+
+  test("unknown fields in view-state patch are dropped from stored projection", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-view-state-unknown");
+    const patch = {
+      viewSide: "bottom",
+      unknownField: "must-not-persist",
+    } as Partial<PcbViewState> & Record<string, unknown>;
+
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-vs-unknown", 0, {
+        type: "pcb_set_view_state",
+        patch,
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const projection = await sdk.getPcbProjection(designId);
+    const viewStateRecord = projection?.board.viewState as
+      | Record<string, unknown>
+      | undefined;
+    expect(viewStateRecord?.viewSide).toBe("bottom");
+    expect(viewStateRecord?.unknownField).toBeUndefined();
+  });
+
+  test("perNetClassAssignments round-trips through the real HTTP command route", async () => {
+    const { sdk, server, designId } = await createDesignerHttp(
+      "pcb-per-net-class-http",
+    );
+    const [powerNetId, bogusClassNetId] = await seedActiveNets(sdk, designId, 2);
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    // Routed through the real parser — if parsePcbSetDesignRulesCommand did NOT
+    // forward perNetClassAssignments, the field would silently vanish here.
+    const res = await postCommand(server, designId, rev0, {
+      type: "pcb_set_design_rules",
+      perNetClassAssignments: {
+        [powerNetId!]: "power",
+        [bogusClassNetId!]: "does-not-exist",
+      },
+    });
+    expect(res.status).toBe(200);
+
+    const proj = await sdk.getPcbProjection(designId);
+    // Known class persists; the unknown class id is dropped on persist.
+    expect(proj?.board.perNetClassAssignments).toEqual({
+      [powerNetId!]: "power",
+    });
+  });
+
+  test("lengthMatchGroups round-trip: persist, retain on unrelated write, clear", async () => {
+    const { sdk, server, designId } = await createDesignerHttp(
+      "pcb-length-groups-http",
+    );
+    const netIds = await seedActiveNets(sdk, designId, 2);
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    // New rules pass through the same strict validator as direct SDK writes.
+    const res = await postCommand(server, designId, rev0, {
+      type: "pcb_set_design_rules",
+      lengthMatchGroups: [
+        {
+          id: "ddr",
+          name: "DDR data",
+          netIds,
+          target: { kind: "longest" },
+          toleranceMm: 0.5,
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+
+    const proj = await sdk.getPcbProjection(designId);
+    expect(proj?.board.lengthMatchGroups).toEqual([
+      {
+        id: "ddr",
+        name: "DDR data",
+        netIds,
+        target: { kind: "longest" },
+        toleranceMm: 0.5,
+      },
+    ]);
+
+    // Other rule edits leave the groups untouched (omitted = unchanged).
+    const rev1 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    await postCommand(server, designId, rev1, {
+      type: "pcb_set_design_rules",
+      boardThicknessMm: 2.0,
+    });
+    const kept = await sdk.getPcbProjection(designId);
+    expect(kept?.board.lengthMatchGroups?.length).toBe(1);
+
+    // Empty array clears the field entirely.
+    const rev2 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    await postCommand(server, designId, rev2, {
+      type: "pcb_set_design_rules",
+      lengthMatchGroups: [],
+    });
+    const cleared = await sdk.getPcbProjection(designId);
+    expect(cleared?.board.lengthMatchGroups).toBeUndefined();
+  });
+
+  test("drcRules round-trip: a well-formed scoped rule persists", async () => {
+    const { sdk, server, designId } = await createDesignerHttp(
+      "pcb-drc-rules-http",
+    );
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const res = await postCommand(server, designId, rev0, {
+      type: "pcb_set_design_rules",
+      drcRules: [
+        {
+          id: "bga",
+          name: "BGA fanout",
+          enabled: true,
+          priority: 10,
+          scopes: [
+            {
+              kind: "area",
+              polygonMm: [
+                { x: 0, y: 0 },
+                { x: 5, y: 0 },
+                { x: 5, y: 5 },
+              ],
+            },
+          ],
+          constraint: { kind: "clearance", mm: 0.1 },
+        },
+      ],
+    });
+    expect(res.status).toBe(200);
+
+    const proj = await sdk.getPcbProjection(designId);
+    expect(proj?.board.drcRules?.map((r) => r.id)).toEqual(["bga"]);
+    expect(proj?.board.drcRules?.[0]?.scopes?.[0]?.kind).toBe("area");
+  });
+
+  // S6: a malformed rule is REFUSED on save, not dropped (rule-semantics
+  // contract §2.1, §12 item 10). Dropping it was fail-open — the author's
+  // tightening rule silently stopped enforcing and nothing said so.
+  test("a malformed drcRule refuses the whole command and persists nothing", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-drc-rules-invalid");
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const command = {
+      type: "pcb_set_design_rules" as const,
+      drcRules: [
+        {
+          id: "bga",
+          name: "BGA fanout",
+          enabled: true,
+          priority: 10,
+          scopes: [],
+          constraint: { kind: "clearance" as const, mm: 0.1 },
+        },
+        // Degenerate area (a single point) — `parseDrcRuleScopes` cannot even
+        // shape it, so the row is `malformed`.
+        {
+          id: "broken",
+          name: "broken area",
+          enabled: true,
+          priority: 1,
+          scopes: [{ kind: "area" as const, polygonMm: [{ x: 0, y: 0 }] }],
+          constraint: { kind: "clearance" as const, mm: 0.2 },
+        },
+      ],
+    };
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-drc-rule-invalid", rev0, command),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected a refusal");
+    expect(result.code).toBe("INVALID_DRC_RULE");
+    if (result.code !== "INVALID_DRC_RULE") throw new Error("wrong code");
+    expect(result.ruleId).toBe("broken");
+    expect(result.detail.length).toBeGreaterThan(0);
+
+    // Nothing persisted — not even the well-formed sibling.
+    const proj = await sdk.getPcbProjection(designId);
+    expect(proj?.board.drcRules).toBeUndefined();
+
+    // The same commandId replays to the SAME refusal, never REVISION_CONFLICT.
+    const replay = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-drc-rule-invalid", rev0, command),
+    );
+    expect(replay).toEqual(result);
+  });
+
+  // A structurally invalid rule the PARSER accepts is caught by the compiler:
+  // two rows sharing an id are `duplicate_id` (§2.1).
+  test("a duplicate rule id refuses the whole command", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-drc-rules-dup");
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-drc-rule-dup", rev0, {
+        type: "pcb_set_design_rules",
+        drcRules: [
+          {
+            id: "same",
+            name: "first",
+            enabled: true,
+            priority: 10,
+            scopes: [],
+            constraint: { kind: "clearance", mm: 0.3 },
+          },
+          {
+            id: "same",
+            name: "second",
+            enabled: true,
+            priority: 5,
+            scopes: [],
+            constraint: { kind: "clearance", mm: 0.1 },
+          },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(false);
+    if (result.ok) throw new Error("expected a refusal");
+    expect(result.code).toBe("INVALID_DRC_RULE");
+    if (result.code !== "INVALID_DRC_RULE") throw new Error("wrong code");
+    expect(result.ruleId).toBe("same");
+    expect((await sdk.getPcbProjection(designId))?.board.drcRules).toBeUndefined();
+  });
+
+  // The HTTP parser forwards `designRules` shape-only, so a dialog that edits
+  // one clearance can legally send a partial object. Validation must normalise
+  // it through the store's own update parse first — compiling the raw payload
+  // read `minimums.clearanceMm` off `undefined`.
+  test("a partial designRules payload alongside drcRules still saves", async () => {
+    const { sdk, server, designId } = await createDesignerHttp(
+      "pcb-rules-partial",
+    );
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const res = await postCommand(server, designId, rev0, {
+      designRules: { clearance: { traceToTraceMm: 0.3 } },
+      drcRules: [
+        {
+          id: "ok",
+          name: "fine",
+          enabled: true,
+          priority: 1,
+          scopes: [],
+          constraint: { kind: "clearance", mm: 0.3 },
+        },
+      ],
+      type: "pcb_set_design_rules",
+    } as never);
+    expect(res.status).toBe(200);
+
+    const board = (await sdk.getPcbProjection(designId))!.board;
+    expect(board.drcRules?.map((r) => r.id)).toEqual(["ok"]);
+    expect(board.designRules.clearance.traceToTraceMm).toBe(0.3);
+    // The omitted keys kept their stored values (§12 item 6), which is what
+    // the rules were validated against.
+    expect(board.designRules.minimums.traceWidthMm).toBe(0.2);
+  });
+
+  // An unknown net CLASS is `ineffective`, not `invalid` (§2.1): the rule still
+  // resolves for whatever else matches, so the save must succeed and batch DRC
+  // must report it. Refusing it here would be fail-closed in the wrong place.
+  test("a netClass scope naming a dropped class is accepted, then reported by DRC", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-rules-unknown-class");
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const result = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-unknown-class", rev0, {
+        type: "pcb_set_design_rules",
+        // Only the default class survives the save, so the rule below names a
+        // class the persisted board does not have. (A malformed class ROW is
+        // refused outright since T-162 — it is not a way to drop a class.)
+        netClasses: [
+          {
+            id: "default",
+            name: "Default",
+            traceWidthMm: 0.25,
+            clearanceMm: 0.25,
+            viaDiameterMm: 0.8,
+            viaDrillMm: 0.4,
+            color: "#d4d4d8",
+            defaultViaProtection: "tented",
+          },
+        ] as never,
+        drcRules: [
+          {
+            id: "ghost-class",
+            name: "Ghost class rule",
+            enabled: true,
+            priority: 1,
+            scopes: [{ kind: "netClass", netClassIds: ["ghost"] }],
+            constraint: { kind: "clearance", mm: 0.9 },
+          },
+        ],
+      }),
+    );
+    expect(result.ok).toBe(true);
+
+    const proj = (await sdk.getPcbProjection(designId))!;
+    expect(proj.board.netClasses.map((c) => c.id)).toEqual(["default"]);
+    expect(proj.board.drcRules?.map((r) => r.id)).toEqual(["ghost-class"]);
+    const report = runDrc(proj);
+    const ineffective = report.violations.find(
+      (v) => v.code === "DRC_RULE_INEFFECTIVE",
+    );
+    expect(ineffective).toBeDefined();
+    expect(ineffective!.message).toContain("Ghost class rule");
+    expect(report.violations.some((v) => v.code === "DRC_RULE_INVALID")).toBe(
+      false,
+    );
+  });
+
+  // The dialog sends `{ clearance, minimums }` only. Before S6 every optional
+  // key it omitted was reset to the default (§12 item 6).
+  test("a dialog-shaped save preserves electrical, the floor and the optional clearances", async () => {
+    const { sdk, designId } = await createDesignerSdk("pcb-rules-optional");
+    const fresh = await sdk.getPcbProjection(designId);
+    // The read path never invents an optional key a board never stored.
+    expect(fresh?.board.designRules.clearance.copperToHoleMm).toBeUndefined();
+    const rev0 = fresh?.revision ?? null;
+    const seeded = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-seed", rev0, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: {
+            traceToTraceMm: 0.25,
+            traceToPadMm: 0.25,
+            padToPadMm: 0.25,
+            traceToViaMm: 0.25,
+            viaToViaMm: 0.3,
+            copperToBoardEdgeMm: 0.5,
+            pourToCopperMm: 0.45,
+            copperToHoleMm: 0.35,
+          },
+          minimums: {
+            traceWidthMm: 0.2,
+            drillSizeMm: 0.4,
+            annularRingMm: 0.2,
+            viaDiameterMm: 0.8,
+            viaDrillMm: 0.4,
+            clearanceMm: 0.12,
+          },
+          electrical: { tempRiseC: 20, copperWeightOz: 2 },
+        },
+      }),
+    );
+    expect(seeded.ok).toBe(true);
+
+    const rev1 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const saved = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-dialog", rev1, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: {
+            traceToTraceMm: 0.3,
+            traceToPadMm: 0.25,
+            padToPadMm: 0.25,
+            traceToViaMm: 0.25,
+            viaToViaMm: 0.3,
+            copperToBoardEdgeMm: 0.5,
+          },
+          minimums: {
+            traceWidthMm: 0.2,
+            drillSizeMm: 0.4,
+            annularRingMm: 0.2,
+            viaDiameterMm: 0.8,
+            viaDrillMm: 0.4,
+          },
+        } as never,
+      }),
+    );
+    expect(saved.ok).toBe(true);
+    const kept = (await sdk.getPcbProjection(designId))?.board.designRules;
+    expect(kept?.clearance.traceToTraceMm).toBe(0.3);
+    expect(kept?.clearance.pourToCopperMm).toBe(0.45);
+    expect(kept?.clearance.copperToHoleMm).toBe(0.35);
+    expect(kept?.minimums.clearanceMm).toBe(0.12);
+    expect(kept?.electrical).toEqual({ tempRiseC: 20, copperWeightOz: 2 });
+
+    // An explicit `null` CLEARS an optional key.
+    const rev2 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    const clearedResult = await sdk.dispatchCommand(
+      designId,
+      envelope(designId, "cmd-rules-clear", rev2, {
+        type: "pcb_set_design_rules",
+        designRules: {
+          clearance: {
+            ...kept!.clearance,
+            pourToCopperMm: null,
+            copperToHoleMm: null,
+          },
+          minimums: { ...kept!.minimums, clearanceMm: null },
+          electrical: null,
+        } as never,
+      }),
+    );
+    expect(clearedResult.ok).toBe(true);
+    const cleared = (await sdk.getPcbProjection(designId))?.board.designRules;
+    expect(cleared?.clearance.pourToCopperMm).toBeUndefined();
+    expect(cleared?.clearance.copperToHoleMm).toBeUndefined();
+    expect(cleared?.minimums.clearanceMm).toBeUndefined();
+    expect(cleared?.electrical).toBeUndefined();
+  });
+
+  test("a new trace on an assigned net adopts that class's width (HTTP, apply-at-creation)", async () => {
+    const { sdk, server, designId } = await createDesignerHttp(
+      "pcb-per-net-class-apply",
+    );
+    const [netId] = await seedActiveNets(sdk, designId, 1);
+    const rev0 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    await postCommand(server, designId, rev0, {
+      type: "pcb_set_design_rules",
+      perNetClassAssignments: { [netId!]: "power" }, // power class width = 0.5 mm
+    });
+
+    const rev1 = (await sdk.getPcbProjection(designId))?.revision ?? null;
+    // Default class + default width — no deliberate choice, so the backend
+    // safety net should upgrade both to the assigned "power" class.
+    await postCommand(server, designId, rev1, {
+      type: "pcb_add_trace",
+      layer: "F.Cu",
+      pointsNm: [
+        { x: 0, y: 0 },
+        { x: 1_000_000, y: 0 },
+      ],
+      widthMm: 0.25,
+      netId: netId!,
+      netClassId: "default",
+      segmentMode: "manhattan-90",
+    });
+
+    const proj = await sdk.getPcbProjection(designId);
+    const trace = proj?.traces.find((t) => t.netId === netId);
+    expect(trace?.netClassId).toBe("power");
+    expect(trace?.widthMm).toBe(0.5);
+  });
+});

@@ -1,0 +1,28 @@
+import { useNavigationStore } from "./stores/navigation-store";
+import { HomeScreen } from "./screens/HomeScreen";
+import { ModuleScreen } from "./screens/ModuleScreen";
+import { SettingsScreen } from "./screens/SettingsScreen";
+
+export function AppRouter() {
+  const currentRoute = useNavigationStore((state) => state.currentRoute);
+
+  if (currentRoute.kind === "home") {
+    return <HomeScreen />;
+  }
+
+  if (currentRoute.kind === "module") {
+    return (
+      <ModuleScreen
+        moduleId={currentRoute.moduleId}
+        designId={currentRoute.designId}
+        params={currentRoute.params}
+      />
+    );
+  }
+
+  if (currentRoute.kind === "settings") {
+    return <SettingsScreen tab={currentRoute.tab} />;
+  }
+
+  return <HomeScreen />;
+}
