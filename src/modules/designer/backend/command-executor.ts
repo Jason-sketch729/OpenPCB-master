@@ -1,0 +1,2995 @@
+import { and, eq, inArray, or } from "drizzle-orm";
+import { validateSiRulesForSave } from "../../../shared/drc/si/rule-input-validation";
+import type { BetterSQLite3Database } from "drizzle-orm/better-sqlite3";
+import type {
+  DesignerCommand,
+  DesignerDispatchResult,
+  DesignerPcbAddTraceCommand,
+  DesignerPcbAddViaCommand,
+  DesignerPcbUpdateViaCommand,
+  DesignerPin,
+  DesignerPrimitive,
+  DesignerSchematicProjection,
+  DrcViolation,
+  LibraryComponentPlacementDetail,
+  PcbCommitLegality,
+  PcbBoardOutline,
+  PcbBoardSettings,
+  PcbPlacedPart,
+  PcbFreePad,
+  PcbFreeHole,
+  PcbCopperLayerId,
+  PcbKeepout,
+  PcbPointMm,
+  PcbTrace,
+  PcbVia,
+  PcbViaType,
+  PcbZone,
+  PcbZoneIslandRemoval,
+  PcbZoneRegion,
+} from "../../../sdks";
+import {
+  insertPrimitiveRow,
+  isPrimitivePinId,
+  loadPrimitiveById,
+  primitiveAsPin,
+  primitiveIdFromPinId,
+  primitivePinId,
+  serializePrimitivePayload,
+} from "./primitive-store";
+import {
+  buildCreateWirePayload,
+  normalizeWirePath,
+  validateWirePath,
+} from "./commands/create-wire";
+import { isFeatureEnabled } from "../../../core/contracts/feature-flags/backend";
+import { autoRouteWirePointsDetailed } from "./routing/wire-obstacles";
+import { applyAutoArrange } from "./layout/arrange-schematic";
+import { executeBatchCommands } from "./commands/batch";
+import { applyRefreshPartFootprint } from "./commands/refresh-footprint";
+import { applyPinElectricalIntent } from "./commands/pin-electrical-intent";
+import { planDuplicatePart } from "./commands/duplicate-part";
+import {
+  buildPlacePartPayload,
+  normalizeRotationDeg,
+  recomputePinWorldPositions,
+} from "./commands/place-part";
+import type {
+  PersistedLabelPayload,
+  PersistedPartPayload,
+  PersistedWirePayload,
+} from "./payload-types";
+import {
+  componentNotFound,
+  duplicateReference,
+  entityNotFound,
+  invalidLabel,
+  invalidPcbBoardSettings,
+  invalidPcbFreeHole,
+  invalidPcbFreePad,
+  invalidPcbKeepout,
+  invalidPcbOverlay,
+  invalidPcbTrace,
+  invalidPcbVia,
+  invalidPcbZone,
+  invalidDrcRule,
+  invalidPrimitive,
+  invalidWirePath,
+  okResult,
+  pcbCopperIllegal,
+  pcbFreeHoleNotFound,
+  pcbFreePadNotFound,
+  pcbKeepoutNotFound,
+  pcbOverlayNotFound,
+  pcbNetClassNotFound,
+  pcbPlacementNotFound,
+  pcbTraceNotFound,
+  pcbViaNotFound,
+  pcbZoneBoardExists,
+  pcbZoneNotFound,
+  pinNotFound,
+  primitiveNotFound,
+} from "./results";
+import {
+  designHeads,
+  schematicLabels,
+  schematicParts,
+  schematicPins,
+  schematicPrimitives,
+  schematicWires,
+} from "./schema";
+import {
+  deletePcbFreeHole,
+  deletePcbFreePad,
+  deletePcbKeepout,
+  deletePcbOverlayShape,
+  deletePcbOverlayText,
+  deletePcbPlacement,
+  deletePcbTrace,
+  deletePcbVia,
+  deletePcbZone,
+  ensurePcbBoardSettings,
+  flipPcbPlacement,
+  insertPcbFreeHole,
+  insertPcbFreePad,
+  insertPcbKeepout,
+  insertPcbOverlayShape,
+  insertPcbOverlayText,
+  insertPcbTrace,
+  insertPcbVia,
+  insertPcbZone,
+  loadPcbFreeHoleById,
+  loadPcbFreePadById,
+  loadPcbKeepoutRowById,
+  loadPcbOverlayShapeById,
+  loadPcbOverlayTextById,
+  loadPcbPlacementById,
+  upsertPcbPlacement,
+  loadPcbTraceById,
+  loadPcbViaById,
+  loadPcbZoneRowById,
+  movePcbPlacement,
+  rotatePcbPlacement,
+  updatePcbActiveLayer,
+  updatePcbBoardSize,
+  updatePcbBoardOutline,
+  updatePcbFreeHole,
+  updatePcbFreePad,
+  updatePcbKeepout,
+  updatePcbOverlayShape,
+  updatePcbOverlayText,
+  updatePcbTrace,
+  updatePcbViewState,
+  updatePcbDesignRules,
+  validateDrcRulesForSave,
+  validateDesignRulesForSave,
+  validateNetClassesForSave,
+  reassignDeletedNetClassCopper,
+  updatePcbVia,
+  updatePcbVisibleLayers,
+  updatePcbZone,
+} from "./pcb/pcb-store";
+import {
+  planCandidatePlacements,
+  type CandidatePlacementOp,
+} from "./pcb/autolayout-candidate-plan";
+import {
+  validatePath as validateTracePath,
+  sanitizePath as sanitizeTracePath,
+} from "./pcb/pcb-trace-geometry";
+import {
+  assemblePcbLegalityInput,
+  loadPcbProjection,
+  netNamesFromSchematic,
+  type PcbLegalityAssembly,
+} from "./pcb/pcb-projection";
+import { loadSchematicProjection } from "./projection-read";
+import {
+  buildDrcItems,
+  type LegalityContext,
+} from "../../../shared/drc/drc-context";
+import {
+  checkPendingCopper,
+  refusedViolations,
+} from "../../../shared/drc/legality";
+import {
+  copperToHoleClearanceMm,
+  createRuleResolver,
+  type RuleResolver,
+} from "../../../shared/drc/rule-resolver";
+import { defaultNetClassId, effectiveNetClassId } from "../../../shared/pcb-areas/net-class-resolver";
+import {
+  buildCopperFillIslands,
+  isTraceCoveredByPour,
+} from "../../../shared/rendering/copper-fill/copper-fill-geometry";
+import {
+  collectCopperZones,
+  collectKeepouts,
+  pourParamsForZone,
+  zonePourNets,
+} from "../../../shared/pcb-areas";
+import {
+  validateTraceAgainstFab,
+  validateViaAgainstFab,
+} from "./pcb/fab-presets";
+import { computeOutlineBboxMm } from "./pcb/outline-geometry";
+import { firstContourError, normalizeContour } from "./pcb/contour-validation";
+import { below } from "./pcb/tolerance";
+import {
+  copperLayerIndex,
+  copperLayersForCount,
+  isCopperLayerId,
+  viaSpanLayers,
+} from "../../../sdks/designer";
+import { boardZoneId } from "../../../shared/pcb-areas/copper-zones";
+import {
+  zoneRegionValidity,
+  zoneRingValidity,
+} from "../../../shared/pcb-areas/zone-parse";
+import {
+  insertVertexOnWire,
+  parseWirePointsJson,
+  updateConnectedWireGeometry,
+} from "./wire-geometry";
+
+import type { NetIdentityMode } from "./net-identity/types";
+import { normalizeCommandNetReferences } from "./net-identity/command-references";
+import { executeNetReferenceRebind } from "./net-identity/rebind";
+import type { RawNetRebindDelta } from "./net-identity/rebind-history-types";
+
+type DbClient = BetterSQLite3Database<Record<string, unknown>>;
+type PinRow = typeof schematicPins.$inferSelect;
+
+/**
+ * The PCB rows `dispatchCommand` already loaded for its history snapshot
+ * before a `pcb_*` command runs. The copper commit gate (live-parity contract
+ * 07 §6) builds its legality context from THESE rows — never from
+ * `loadPcbProjection`, which migrates and syncs placements (writes) and would
+ * leak placement changes into the command's undo patch.
+ */
+export interface PcbRowsBefore {
+  board: PcbBoardSettings;
+  placements: PcbPlacedPart[];
+  traces: PcbTrace[];
+  vias: PcbVia[];
+  freeHoles: PcbFreeHole[];
+  freePads: PcbFreePad[];
+  zones: PcbZone[];
+  keepouts: PcbKeepout[];
+}
+
+export interface ExecuteDesignerCommandParams {
+  tx: DbClient;
+  designId: string;
+  revision: number;
+  command: DesignerCommand;
+  projection: DesignerSchematicProjection;
+  timestamp: string;
+  identityMode: NetIdentityMode;
+  placeComponentDetail: LibraryComponentPlacementDetail | null;
+  /**
+   * `refresh_part_footprint` only: freshly resolved library detail per
+   * `componentId`, resolved by the store before the transaction opens.
+   */
+  refreshComponentDetails?: ReadonlyMap<
+    string,
+    LibraryComponentPlacementDetail
+  >;
+  /** Present for every `pcb_*` command (see `PcbRowsBefore`). */
+  pcbBefore?: PcbRowsBefore;
+  onNetRebindApplied?: (delta: RawNetRebindDelta) => void;
+}
+
+function isFinitePoint(point: { x: number; y: number }): boolean {
+  return Number.isFinite(point.x) && Number.isFinite(point.y);
+}
+
+const MAX_BOARD_DIM_MM = 2000;
+
+/** `""` is never a net id or net name (zone/keepout contract §3.2). */
+function emptyToNull(value: string | null): string | null {
+  return value ? value : null;
+}
+
+function copyZoneRegion(region: PcbZoneRegion): PcbZoneRegion {
+  if (region.kind === "board") return { kind: "board" };
+  // An empty cutout list normalises to an absent key (copper-pour §11).
+  const holesMm = (region.holesMm ?? []).map((hole) =>
+    hole.map((p) => ({ x: p.x, y: p.y })),
+  );
+  return {
+    kind: "polygon",
+    pointsMm: region.pointsMm.map((p) => ({ x: p.x, y: p.y })),
+    ...(holesMm.length === 0 ? {} : { holesMm }),
+  };
+}
+
+function copyIslandRemoval(value: PcbZoneIslandRemoval): PcbZoneIslandRemoval {
+  return typeof value === "string" ? value : { minAreaMm2: value.minAreaMm2 };
+}
+
+/**
+ * The value rules shared by `pcb_add_zone` and `pcb_update_zone` (contract
+ * §12.2). Returns the failure detail, or null when every provided field is in
+ * range. A fractional or negative `priority` is rejected here rather than
+ * silently floored: the derivation normalises persisted rows, but the command
+ * boundary is where a producer can still be told it is wrong.
+ */
+/**
+ * Contract §12.2: a locked row accepts `locked: false` and nothing else in the
+ * same command, so an unlock can never smuggle edits past the lock gate.
+ */
+function unlockOnly(
+  command: object,
+  idField: "zoneId" | "keepoutId",
+): boolean {
+  for (const [key, value] of Object.entries(command)) {
+    if (value === undefined) continue;
+    if (key === "type" || key === idField || key === "locked") continue;
+    return false;
+  }
+  return true;
+}
+
+function zoneValueError(command: {
+  priority?: number;
+  clearanceMm?: number | null;
+  minWidthMm?: number | null;
+  thermal?: { gapMm: number; spokeWidthMm: number } | null;
+  islandRemoval?: PcbZoneIslandRemoval | null;
+}): string | null {
+  if (command.priority !== undefined) {
+    if (!Number.isInteger(command.priority) || command.priority < 0) {
+      return "priority must be an integer >= 0";
+    }
+  }
+  const overrides: Array<[string, number | null | undefined]> = [
+    ["clearanceMm", command.clearanceMm],
+    ["minWidthMm", command.minWidthMm],
+  ];
+  for (const [field, value] of overrides) {
+    if (value === undefined || value === null) continue;
+    if (!Number.isFinite(value) || value < 0) {
+      return `${field} must be a finite number >= 0`;
+    }
+  }
+  const thermal = command.thermal;
+  if (thermal !== undefined && thermal !== null) {
+    if (
+      !Number.isFinite(thermal.gapMm) ||
+      !(thermal.gapMm > 0) ||
+      !Number.isFinite(thermal.spokeWidthMm) ||
+      !(thermal.spokeWidthMm > 0)
+    ) {
+      return "thermal gapMm and spokeWidthMm must be finite numbers > 0";
+    }
+  }
+  const islandRemoval = command.islandRemoval;
+  if (
+    islandRemoval !== undefined &&
+    islandRemoval !== null &&
+    typeof islandRemoval !== "string"
+  ) {
+    if (
+      !Number.isFinite(islandRemoval.minAreaMm2) ||
+      islandRemoval.minAreaMm2 < 0
+    ) {
+      return "islandRemoval.minAreaMm2 must be a finite number >= 0";
+    }
+  }
+  return null;
+}
+
+/** First occurrence wins, so the persisted order is the client's order. */
+function dedupeLayers(layers: PcbCopperLayerId[]): PcbCopperLayerId[] {
+  const seen = new Set<string>();
+  const out: PcbCopperLayerId[] = [];
+  for (const layer of layers) {
+    if (seen.has(layer)) continue;
+    seen.add(layer);
+    out.push(layer);
+  }
+  return out;
+}
+
+function keepoutLayerError(
+  layers: PcbCopperLayerId[],
+  stackup: readonly PcbCopperLayerId[],
+): string | null {
+  if (layers.length === 0) return "layers must not be empty";
+  for (const layer of layers) {
+    if (!isCopperLayerId(layer)) return `${layer} is not a copper layer`;
+    if (!stackup.includes(layer)) {
+      return `layer ${layer} is not on the board stackup`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Validate a board outline (or cutout shape). Returns an error message, or null
+ * when valid. Shared by the rect and the general outline command paths.
+ */
+function validateBoardOutlineGeometry(outline: PcbBoardOutline): string | null {
+  if (outline.widthMm <= 0 || outline.heightMm <= 0) {
+    return "board width and height must be positive";
+  }
+  if (
+    outline.widthMm > MAX_BOARD_DIM_MM ||
+    outline.heightMm > MAX_BOARD_DIM_MM
+  ) {
+    return `board width and height must be <= ${MAX_BOARD_DIM_MM}mm`;
+  }
+  if (!isFinitePoint(outline.centerMm)) {
+    return "board center must be finite";
+  }
+  switch (outline.kind) {
+    case "roundrect":
+      if (
+        !Number.isFinite(outline.cornerRadiusMm) ||
+        outline.cornerRadiusMm < 0
+      ) {
+        return "corner radius must be a non-negative number";
+      }
+      return null;
+    case "polygon":
+      if (outline.pointsMm.length < 3) return "polygon needs >= 3 points";
+      if (!outline.pointsMm.every(isFinitePoint)) {
+        return "polygon points must be finite";
+      }
+      return null;
+    case "contour":
+      // Deep contour rules (closure, arc-radius consistency, simplicity) live
+      // in the shared validator. Callers must {@link normalizeContour} first so
+      // the explicit-closure check holds.
+      //
+      // ORDER is the validator's own (exact-geometry contract 12 §3.2): the
+      // AUTHORED rules — finiteness, arc radii, `full-circle-arc`,
+      // `too-few-segments`, degenerate edges, closure — then canonicalisation,
+      // then simplicity on the canonical exact ring. Nothing derived is
+      // persisted: `normalizeContour` does not project, and what this executor
+      // stores below is the AUTHORED contour.
+      return firstContourError(outline);
+    default:
+      return null;
+  }
+}
+
+function mapPinRow(row: PinRow): DesignerPin {
+  return {
+    id: row.id,
+    originPinKey: row.originPinKey,
+    number: row.number,
+    name: row.name,
+    electricalType: row.electricalType,
+    ...(row.electricalIntent === null ? {} : { electricalIntent: row.electricalIntent }),
+    unit: row.unit,
+    localPositionNm: { x: row.localXNm, y: row.localYNm },
+    worldPositionNm: { x: row.worldXNm, y: row.worldYNm },
+  };
+}
+
+// Resolves a pin id that may reference either a real part pin
+// (`schematicPins.id`) or a synthetic primitive pin (`primitive:<id>`).
+function resolvePinAny(
+  tx: DbClient,
+  designId: string,
+  pinId: string,
+): DesignerPin | null {
+  if (isPrimitivePinId(pinId)) {
+    const primitive = loadPrimitiveById(
+      tx,
+      designId,
+      primitiveIdFromPinId(pinId),
+    );
+    return primitive ? primitiveAsPin(primitive) : null;
+  }
+  const row = tx
+    .select()
+    .from(schematicPins)
+    .where(
+      and(eq(schematicPins.designId, designId), eq(schematicPins.id, pinId)),
+    )
+    .get();
+  return row ? mapPinRow(row) : null;
+}
+
+function bumpRevision(
+  tx: DbClient,
+  designId: string,
+  revision: number,
+  timestamp: string,
+): number {
+  const nextRevision = revision + 1;
+  tx.update(designHeads)
+    .set({ revision: nextRevision, updatedAt: timestamp })
+    .where(eq(designHeads.id, designId))
+    .run();
+  return nextRevision;
+}
+
+type PcbTraceInput = Omit<DesignerPcbAddTraceCommand, "type">;
+type PcbViaInput = Omit<DesignerPcbAddViaCommand, "type"> & {
+  type?: "pcb_add_via" | "pcb_add_manual_via";
+};
+
+/**
+ * Apply-at-creation safety net: when a trace/via is created on a net that has
+ * an explicit class assignment but the request still carries the board's
+ * default class (no deliberate choice), upgrade it to the assigned class. An
+ * explicit non-default class is honored as-is. The frontend route session sets
+ * this at session start; this guards programmatic inserts.
+ */
+
+function buildPcbTraceForInsert(
+  input: PcbTraceInput,
+  board: PcbBoardSettings,
+): { trace: PcbTrace } | { error: DesignerDispatchResult } {
+  const netClassId = effectiveNetClassId(board, input.netId, input.netClassId);
+  const netClass = board.netClasses.find((nc) => nc.id === netClassId);
+  if (!netClass) return { error: pcbNetClassNotFound(netClassId) };
+  const sanitized = sanitizeTracePath(input.pointsNm);
+  if (sanitized.length < 2) {
+    return {
+      error: invalidPcbTrace("path must have at least 2 distinct points"),
+    };
+  }
+  const reason = validateTracePath(sanitized, input.segmentMode);
+  if (reason) return { error: invalidPcbTrace(reason) };
+  // If we upgraded an un-chosen (default) class, take the assigned class's
+  // trace width too — but never override a width the caller explicitly set.
+  // Through the ONE default-class helper (§3 step 3), never a raw array read.
+  const defaultWidth = board.netClasses.find(
+    (nc) => nc.id === defaultNetClassId(board.netClasses),
+  )?.traceWidthMm;
+  const widthMm =
+    netClassId !== input.netClassId && input.widthMm === defaultWidth
+      ? netClass.traceWidthMm
+      : input.widthMm;
+  const trace: PcbTrace = {
+    id: crypto.randomUUID(),
+    netId: input.netId,
+    netClassId,
+    layer: input.layer,
+    widthMm,
+    pointsNm: sanitized,
+    segmentMode: input.segmentMode,
+  };
+  const violations = validateTraceAgainstFab(trace, board.fabricator);
+  if (violations.length > 0) {
+    console.warn(
+      `[fab-preset] trace ${trace.id}: ${violations
+        .map((v) => v.message)
+        .join("; ")}`,
+    );
+  }
+  return { trace };
+}
+
+
+
+/**
+ * Resolve + validate the via's layer span. Default (and everything the
+ * interactive route tool emits) is a through via F.Cu→B.Cu. Non-through
+ * types (blind/buried/micro) are accepted data-only behind the
+ * `pcb.advancedVias` dev flag — no picker UI yet.
+ */
+function resolveViaSpan(
+  input: PcbViaInput,
+  board: PcbBoardSettings,
+):
+  | { fromLayer: PcbCopperLayerId; toLayer: PcbCopperLayerId; viaType: PcbViaType }
+  | { error: DesignerDispatchResult } {
+  const viaType = input.viaType ?? "through";
+  if (viaType === "through") {
+    // Through barrels always span the full stackup; an explicit span on a
+    // through via is rejected rather than silently rewritten.
+    if (
+      (input.fromLayer !== undefined && input.fromLayer !== "F.Cu") ||
+      (input.toLayer !== undefined && input.toLayer !== "B.Cu")
+    ) {
+      return {
+        error: invalidPcbVia("through vias always span F.Cu to B.Cu"),
+      };
+    }
+    return { fromLayer: "F.Cu", toLayer: "B.Cu", viaType };
+  }
+  if (!isFeatureEnabled("pcb.advancedVias")) {
+    return {
+      error: invalidPcbVia(
+        `via type "${viaType}" requires the pcb.advancedVias feature`,
+      ),
+    };
+  }
+  const fromLayer = input.fromLayer ?? "F.Cu";
+  const toLayer = input.toLayer ?? "B.Cu";
+  // Creation gate is permissive: enforce only the layer vocabulary + downward
+  // ordering here. Exact blind/buried/micro topology (which outer layers a
+  // type may touch) is a manufacturability concern surfaced as a DRC warning
+  // (audit B2-7), not a hard block on entering geometry — mirrors KiCad, which
+  // lets you draw an off-spec padstack and flags it at DRC.
+  const fromIdx = copperLayerIndex(fromLayer, board.layerCount);
+  const toIdx = copperLayerIndex(toLayer, board.layerCount);
+  if (fromIdx === null || toIdx === null) {
+    return {
+      error: invalidPcbVia(
+        `via span ${fromLayer}→${toLayer} is invalid for a ${board.layerCount}-layer board`,
+      ),
+    };
+  }
+  if (fromIdx >= toIdx) {
+    return {
+      error: invalidPcbVia("via span must go downward through the stackup"),
+    };
+  }
+  return { fromLayer, toLayer, viaType };
+}
+
+/**
+ * The rule resolver a command handler resolves scoped constraints through —
+ * the SAME `createRuleResolver` batch DRC builds (rule-semantics contract §9),
+ * so the via insert gate and the DRC report cannot disagree about a minimum.
+ * Net names come from the schematic because a `netClass` scope may resolve
+ * through the GND / power NAME heuristic (§3 step 2), not only through an
+ * explicit assignment.
+ */
+function ruleResolverFor(
+  tx: DbClient,
+  designId: string,
+  board: PcbBoardSettings,
+): RuleResolver {
+  return createRuleResolver(
+    board,
+    Object.fromEntries(
+      netNamesFromSchematic(loadSchematicProjection(tx, designId)),
+    ),
+    { validCopperLayers: copperLayersForCount(board.layerCount) },
+  );
+}
+
+/**
+ * A via's size against the board: positive, diameter over drill, and the
+ * scoped `viaDiameter` / `viaDrill` / `annularRing` minimums. ONE check for the
+ * insert gate and the inspector edit, so an edit can never store a via the
+ * insert would have refused.
+ */
+function viaSizeError(
+  via: {
+    netId: string | null;
+    centerMm: PcbPointMm;
+    diameterMm: number;
+    drillMm: number;
+    layers: readonly PcbCopperLayerId[];
+  },
+  board: PcbBoardSettings,
+  resolver: RuleResolver,
+): DesignerDispatchResult | null {
+  const { diameterMm, drillMm } = via;
+  if (!Number.isFinite(diameterMm) || diameterMm <= 0) {
+    return invalidPcbVia("via diameter must be positive");
+  }
+  if (!Number.isFinite(drillMm) || drillMm <= 0) {
+    return invalidPcbVia("via drill must be positive");
+  }
+  if (diameterMm <= drillMm) {
+    return invalidPcbVia("via diameter must exceed drill");
+  }
+  // Scope geometry for the resolver: the via's copper disc over its span.
+  const scalarItem = {
+    netId: via.netId,
+    layers: via.layers,
+    geometry: {
+      kind: "disc" as const,
+      center: via.centerMm,
+      radiusMm: diameterMm / 2,
+    },
+  };
+  // Scoped scalar rules gate the via exactly as the board minimum does
+  // (rule-semantics contract §5.1): the resolution is first-match, then
+  // floored by the board minimum, so this can only ever be at least as strict.
+  const requiredDiameterMm = resolver.scalar("viaDiameter", scalarItem).mm;
+  if (below(diameterMm, requiredDiameterMm)) {
+    return invalidPcbVia("via diameter is below board minimum");
+  }
+  const requiredDrillMm = resolver.scalar("viaDrill", scalarItem).mm;
+  // `drillSizeMm` has no scalar rule kind and stays board-only (§5.1).
+  if (
+    below(drillMm, requiredDrillMm) ||
+    below(drillMm, board.designRules.minimums.drillSizeMm)
+  ) {
+    return invalidPcbVia("via drill is below board minimum");
+  }
+  const requiredAnnularMm = resolver.scalar("annularRing", scalarItem).mm;
+  if (below((diameterMm - drillMm) / 2, requiredAnnularMm)) {
+    return invalidPcbVia("via annular ring is below board minimum");
+  }
+  return null;
+}
+
+/**
+ * The span an inspector edit leaves the via with. Untouched type and layers
+ * keep the stored span as-is — a release build (no `pcb.advancedVias`) can
+ * still resize an imported blind via — and `viaType: "through"` alone converts
+ * any via to the full F.Cu→B.Cu barrel. Anything else goes through the insert's
+ * `resolveViaSpan`, flag and stackup checks included.
+ */
+function resolveUpdatedViaSpan(
+  existing: PcbVia,
+  command: DesignerPcbUpdateViaCommand,
+  board: PcbBoardSettings,
+):
+  | { fromLayer: PcbCopperLayerId; toLayer: PcbCopperLayerId; viaType: PcbViaType }
+  | { error: DesignerDispatchResult } {
+  if (
+    command.viaType === undefined &&
+    command.fromLayer === undefined &&
+    command.toLayer === undefined
+  ) {
+    return {
+      fromLayer: existing.fromLayer,
+      toLayer: existing.toLayer,
+      viaType: existing.viaType,
+    };
+  }
+  const viaType = command.viaType ?? existing.viaType;
+  const keepStoredLayers = viaType !== "through";
+  const fromLayer =
+    command.fromLayer ?? (keepStoredLayers ? existing.fromLayer : undefined);
+  const toLayer =
+    command.toLayer ?? (keepStoredLayers ? existing.toLayer : undefined);
+  return resolveViaSpan(
+    {
+      centerMm: existing.centerMm,
+      netId: existing.netId,
+      netClassId: existing.netClassId,
+      viaType,
+      ...(fromLayer !== undefined ? { fromLayer } : {}),
+      ...(toLayer !== undefined ? { toLayer } : {}),
+    },
+    board,
+  );
+}
+
+function buildPcbViaForInsert(
+  input: PcbViaInput,
+  board: PcbBoardSettings,
+  resolver: RuleResolver,
+): { via: PcbVia } | { error: DesignerDispatchResult } {
+  const netClassId = effectiveNetClassId(board, input.netId, input.netClassId);
+  const netClass = board.netClasses.find((nc) => nc.id === netClassId);
+  if (!netClass) return { error: pcbNetClassNotFound(netClassId) };
+  const diameterMm = input.diameterMmOverride ?? netClass.viaDiameterMm;
+  const drillMm = input.drillMmOverride ?? netClass.viaDrillMm;
+  const span = resolveViaSpan(input, board);
+  // An unresolvable span cannot narrow a `layer` scope, so the size check falls
+  // back to the whole stackup — conservative, and the span error is still
+  // returned below in the order this gate has always reported it.
+  const sizeError = viaSizeError(
+    {
+      netId: input.netId,
+      centerMm: input.centerMm,
+      diameterMm,
+      drillMm,
+      layers:
+        "error" in span
+          ? copperLayersForCount(board.layerCount)
+          : viaSpanLayers(span.fromLayer, span.toLayer, board.layerCount),
+    },
+    board,
+    resolver,
+  );
+  if (sizeError) return { error: sizeError };
+  if ("error" in span) return span;
+  const via: PcbVia = {
+    id: crypto.randomUUID(),
+    netId: input.netId,
+    netClassId,
+    centerMm: input.centerMm,
+    diameterMm,
+    drillMm,
+    fromLayer: span.fromLayer,
+    toLayer: span.toLayer,
+    viaType: span.viaType,
+    protection: netClass.defaultViaProtection,
+    provenance: "route",
+  };
+  const violations = validateViaAgainstFab(via, board.fabricator);
+  if (violations.length > 0) {
+    console.warn(
+      `[fab-preset] via ${via.id}: ${violations
+        .map((v) => v.message)
+        .join("; ")}`,
+    );
+  }
+  return { via };
+}
+
+export function insertPart(
+  tx: DbClient,
+  designId: string,
+  payload: PersistedPartPayload,
+  timestamp: string,
+): void {
+  tx.insert(schematicParts)
+    .values({
+      id: payload.id,
+      designId,
+      componentId: payload.componentId,
+      reference: payload.reference,
+      value: payload.value,
+      positionXNm: payload.positionNm.x,
+      positionYNm: payload.positionNm.y,
+      rotationDeg: payload.rotationDeg,
+      mirrored: payload.mirrored ? 1 : 0,
+      symbolSnapshotJson: JSON.stringify(payload.symbol),
+      footprintSnapshotJson: JSON.stringify(payload.footprint),
+      propertiesJson: payload.propertiesJson ?? "{}",
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    })
+    .run();
+
+  for (const pin of payload.pins) {
+    tx.insert(schematicPins)
+      .values({
+        id: pin.id,
+        designId,
+        partId: payload.id,
+        originPinKey: pin.originPinKey,
+        number: pin.number,
+        name: pin.name,
+        electricalType: pin.electricalType,
+        electricalIntent: pin.electricalIntent ?? null,
+        unit: pin.unit,
+        localXNm: pin.localPositionNm.x,
+        localYNm: pin.localPositionNm.y,
+        worldXNm: pin.worldPositionNm.x,
+        worldYNm: pin.worldPositionNm.y,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      })
+      .run();
+  }
+}
+
+export function insertWire(
+  tx: DbClient,
+  designId: string,
+  payload: PersistedWirePayload,
+  timestamp: string,
+): void {
+  tx.insert(schematicWires)
+    .values({
+      id: payload.id,
+      designId,
+      sourcePinId: payload.sourcePinId,
+      targetPinId: payload.targetPinId,
+      pointsJson: JSON.stringify(payload.pointsNm),
+      routeStatus: payload.routeStatus ?? null,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    })
+    .run();
+}
+
+function updatePartPinsAndConnectedWires(params: {
+  tx: DbClient;
+  designId: string;
+  partId: string;
+  positionNm: { x: number; y: number };
+  rotationDeg: number;
+  mirrored: boolean;
+  timestamp: string;
+  projection: DesignerSchematicProjection;
+}): void {
+  const {
+    tx,
+    designId,
+    partId,
+    positionNm,
+    rotationDeg,
+    mirrored,
+    timestamp,
+    projection,
+  } = params;
+  const pinRows = tx
+    .select()
+    .from(schematicPins)
+    .where(eq(schematicPins.partId, partId))
+    .all();
+  const worlds = recomputePinWorldPositions(
+    pinRows.map((pin) => ({
+      localPositionNm: { x: pin.localXNm, y: pin.localYNm },
+    })),
+    positionNm,
+    normalizeRotationDeg(rotationDeg),
+    mirrored,
+  );
+  const nextByPinId = new Map<string, { x: number; y: number }>();
+  for (let index = 0; index < pinRows.length; index += 1) {
+    const pin = pinRows[index];
+    const world = worlds[index];
+    if (!pin || !world) continue;
+    nextByPinId.set(pin.id, { x: world.x, y: world.y });
+    tx.update(schematicPins)
+      .set({ worldXNm: world.x, worldYNm: world.y, updatedAt: timestamp })
+      .where(eq(schematicPins.id, pin.id))
+      .run();
+  }
+  updateConnectedWireGeometry({
+    tx,
+    designId,
+    movedPinIds: [...nextByPinId.keys()],
+    nextByPinId,
+    timestamp,
+    projection,
+  });
+}
+
+/** `refuse` is the default for every gated command (contract 07 §6). */
+function commandLegality(command: DesignerCommand): PcbCommitLegality {
+  return "legality" in command && command.legality !== undefined
+    ? command.legality
+    : "refuse";
+}
+
+interface EnvelopeLegality {
+  /**
+   * The context the gate judges against, or `null` for a non-`pcb_*` envelope
+   * and under `legality: "off"`, where no verdict is computed at all.
+   */
+  context(): LegalityContext | null;
+  /**
+   * A board trace as the context sees it. Legacy mode resolves importer name
+   * hints without changing stored rows; durable mode preserves authored ids.
+   * Pending copper must use this same row to avoid judging a legacy hint
+   * against its own already-bound net. Undefined when no context/row exists.
+   */
+  boundTrace(traceId: string): PcbTrace | undefined;
+  /** The via twin of `boundTrace`; only legacy mode resolves name hints. */
+  boundVia(viaId: string): PcbVia | undefined;
+}
+
+/**
+ * The legality derivation for THIS envelope, run at most once and only when a
+ * gated handler asks for it: from the rows `dispatchCommand` snapshotted, never
+ * from `loadPcbProjection` (contract 07 §6) — its placement sync writes, and
+ * those writes would land in the command's undo patch.
+ */
+function legalityFor(params: ExecuteDesignerCommandParams): EnvelopeLegality {
+  let assembly: PcbLegalityAssembly | null = null;
+  let context: LegalityContext | null = null;
+  let built = false;
+  const assemble = (): PcbLegalityAssembly | null => {
+    if (built) return assembly;
+    built = true;
+    const rows = params.pcbBefore;
+    if (!rows || commandLegality(params.command) === "off") return assembly;
+    assembly = assemblePcbLegalityInput({
+      schematic: params.projection,
+      ...rows,
+    }, params.identityMode);
+    context = buildDrcItems(assembly);
+    return assembly;
+  };
+  return {
+    context: () => {
+      assemble();
+      return context;
+    },
+    boundTrace: (traceId) =>
+      assemble()?.traces.find((trace) => trace.id === traceId),
+    boundVia: (viaId) => assemble()?.vias.find((via) => via.id === viaId),
+  };
+}
+
+/** The gate verdict: what blocks the commit, and how much it only warns about. */
+interface CopperVerdict {
+  refused: DrcViolation[];
+  warnings: number;
+}
+
+/**
+ * The reference DRC verdict on the copper a command is about to commit
+ * (contract 07 §6). `null` when no context exists (`legality: "off"`), which is
+ * also what keeps the `legality` field off that command's ok result.
+ * Suppressions are NOT passed: `checkPendingCopper` defaults them from the
+ * board's view state and severity overrides exactly as the report does.
+ */
+function gateCopper(
+  ctx: LegalityContext | null,
+  pending: { traces: PcbTrace[]; vias: PcbVia[] },
+  legality: PcbCommitLegality,
+  replaces?: readonly string[],
+): CopperVerdict | null {
+  if (!ctx || legality === "off") return null;
+  const violations = checkPendingCopper(
+    ctx,
+    pending,
+    replaces ? { replaces } : {},
+  );
+  const refused = refusedViolations(ctx, violations);
+  return { refused, warnings: violations.length - refused.length };
+}
+
+/**
+ * The refusal result when the gate blocks, or `null` to carry on with the
+ * insert — `report` computes the verdict and never blocks on it (§6).
+ */
+function copperRefusal(
+  verdict: CopperVerdict | null,
+  legality: PcbCommitLegality,
+): DesignerDispatchResult | null {
+  if (legality !== "refuse" || !verdict || verdict.refused.length === 0) {
+    return null;
+  }
+  return pcbCopperIllegal(verdict.refused);
+}
+
+/** Counts for the ok result; `undefined` leaves the field off entirely. */
+function legalityCounts(
+  verdict: CopperVerdict | null,
+): { refused: number; warnings: number } | undefined {
+  return verdict
+    ? { refused: verdict.refused.length, warnings: verdict.warnings }
+    : undefined;
+}
+
+export function executeDesignerCommand(
+  params: ExecuteDesignerCommandParams,
+): DesignerDispatchResult {
+  const {
+    tx,
+    designId,
+    revision,
+    command: originalCommand,
+    projection,
+    timestamp,
+    identityMode,
+    placeComponentDetail,
+    refreshComponentDetails,
+  } = params;
+  if (originalCommand.type === "batch_commands") {
+    return executeBatchCommands({
+      tx,
+      designId,
+      revision,
+      timestamp,
+      command: originalCommand,
+      projection,
+      executeStep: (step) =>
+        executeDesignerCommand({
+          tx: step.tx,
+          designId,
+          revision,
+          command: step.command,
+          projection: step.projection,
+          timestamp,
+          identityMode,
+          placeComponentDetail: null,
+          ...(step.pcbBefore ? { pcbBefore: step.pcbBefore } : {}),
+        }),
+    });
+  }
+  const normalized = normalizeCommandNetReferences({
+    command: originalCommand, projection, tx, designId, mode: identityMode,
+  });
+  if (!normalized.ok) return normalized.result;
+  const { command } = normalized;
+  if (command.type === "batch_commands") {
+    throw new Error("net-reference normalization must not synthesize a batch command");
+  }
+  if (command.type === "pcb_rebind_net_references") {
+    return executeNetReferenceRebind({ ...params, command, bumpRevision: () => bumpRevision(tx, designId, revision, timestamp) });
+  }
+  const gate = legalityFor({ ...params, command });
+  if (command.type === "pcb_set_board_settings") {
+    if (command.widthMm <= 0 || command.heightMm <= 0) {
+      return invalidPcbBoardSettings("board width and height must be positive");
+    }
+    if (command.widthMm > 2000 || command.heightMm > 2000) {
+      return invalidPcbBoardSettings(
+        "board width and height must be <= 2000mm",
+      );
+    }
+    if (
+      command.centerMm &&
+      (!Number.isFinite(command.centerMm.x) ||
+        !Number.isFinite(command.centerMm.y))
+    ) {
+      return invalidPcbBoardSettings("board center must be finite");
+    }
+    updatePcbBoardSize({
+      db: tx,
+      designId,
+      widthMm: command.widthMm,
+      heightMm: command.heightMm,
+      ...(command.centerMm ? { centerMm: command.centerMm } : {}),
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_set_board_outline") {
+    // Canonicalise contours (drop degenerate edges, force explicit closure)
+    // before validating so every producer — draw tool, edits, DXF import, raw
+    // HTTP — is held to the same shape contract.
+    const normalizedOutline =
+      command.outline.kind === "contour"
+        ? normalizeContour(command.outline)
+        : command.outline;
+    const invalid = validateBoardOutlineGeometry(normalizedOutline);
+    if (invalid) return invalidPcbBoardSettings(invalid);
+    const normalizedCutouts = command.cutouts?.map((cut) => ({
+      ...cut,
+      shape:
+        cut.shape.kind === "contour"
+          ? normalizeContour(cut.shape)
+          : cut.shape,
+    }));
+    for (const cut of normalizedCutouts ?? []) {
+      const cutInvalid = validateBoardOutlineGeometry(cut.shape);
+      if (cutInvalid) return invalidPcbBoardSettings(`cutout: ${cutInvalid}`);
+    }
+    // Recompute the cached bbox so non-rect shapes report a correct footprint.
+    const bbox = computeOutlineBboxMm(normalizedOutline);
+    const outline = { ...normalizedOutline, ...bbox };
+    const cutouts = normalizedCutouts?.map((cut) => ({
+      ...cut,
+      shape: { ...cut.shape, ...computeOutlineBboxMm(cut.shape) },
+    }));
+    updatePcbBoardOutline({
+      db: tx,
+      designId,
+      outline,
+      ...(cutouts ? { cutouts } : {}),
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_move_placement") {
+    const moved = movePcbPlacement({
+      db: tx,
+      designId,
+      placementId: command.placementId,
+      positionMm: command.positionMm,
+      timestamp,
+    });
+    if (!moved) return pcbPlacementNotFound(command.placementId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_move_placements") {
+    // A returned refusal commits the command transaction, so validate all IDs
+    // before the mutating move helper writes any placement.
+    for (const update of command.updates) {
+      if (!loadPcbPlacementById(tx, designId, update.placementId)) {
+        return pcbPlacementNotFound(update.placementId);
+      }
+    }
+    for (const update of command.updates) {
+      const moved = movePcbPlacement({
+        db: tx,
+        designId,
+        placementId: update.placementId,
+        positionMm: update.positionMm,
+        timestamp,
+      });
+      if (!moved) return pcbPlacementNotFound(update.placementId);
+    }
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_rotate_placement") {
+    const rotated = rotatePcbPlacement({
+      db: tx,
+      designId,
+      placementId: command.placementId,
+      rotationDeg: command.rotationDeg,
+      timestamp,
+    });
+    if (!rotated) return pcbPlacementNotFound(command.placementId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_flip_placement") {
+    const flipped = flipPcbPlacement({
+      db: tx,
+      designId,
+      placementId: command.placementId,
+      timestamp,
+    });
+    if (!flipped) return pcbPlacementNotFound(command.placementId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_flip_placements") {
+    const placementIds = [...new Set(command.placementIds)];
+    for (const placementId of placementIds) {
+      if (!loadPcbPlacementById(tx, designId, placementId)) {
+        return pcbPlacementNotFound(placementId);
+      }
+    }
+    for (const placementId of placementIds) {
+      const flipped = flipPcbPlacement({
+        db: tx,
+        designId,
+        placementId,
+        timestamp,
+      });
+      if (!flipped) return pcbPlacementNotFound(placementId);
+    }
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_set_active_layer") {
+    updatePcbActiveLayer({
+      db: tx,
+      designId,
+      layer: command.layer,
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_set_visible_layers") {
+    updatePcbVisibleLayers({
+      db: tx,
+      designId,
+      visibleLayers: command.visibleLayers,
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_add_trace") {
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const built = buildPcbTraceForInsert(command, board);
+    if ("error" in built) return built.error;
+    const { trace } = built;
+    // The gate judges the BUILT trace (its assigned id, its resolved width) and
+    // runs before the insert, so a refusal persists nothing (contract 07 §6).
+    const legality = commandLegality(command);
+    const verdict = gateCopper(
+      gate.context(),
+      { traces: [trace], vias: [] },
+      legality,
+    );
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    insertPcbTrace(tx, designId, trace, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      trace.id,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_add_via") {
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const ctx = gate.context();
+    const built = buildPcbViaForInsert(
+      command,
+      board,
+      // ONE resolver compile per envelope: the context already holds the one
+      // batch DRC would use. `ruleResolverFor` remains the `off` path.
+      ctx?.resolver ?? ruleResolverFor(tx, designId, board),
+    );
+    if ("error" in built) return built.error;
+    const { via } = built;
+    const legality = commandLegality(command);
+    const verdict = gateCopper(ctx, { traces: [], vias: [via] }, legality);
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    insertPcbVia(tx, designId, via, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      via.id,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_add_trace_via") {
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const ctx = gate.context();
+    const builtTrace = buildPcbTraceForInsert(command.trace, board);
+    if ("error" in builtTrace) return builtTrace.error;
+    const builtVia = buildPcbViaForInsert(
+      command.via,
+      board,
+      ctx?.resolver ?? ruleResolverFor(tx, designId, board),
+    );
+    if ("error" in builtVia) return builtVia.error;
+    // Trace and via are judged TOGETHER — they are one commit, so the via
+    // against its own trace is a same-net pair that skips, exactly as it will
+    // once both are on the board.
+    const legality = commandLegality(command);
+    const verdict = gateCopper(
+      ctx,
+      { traces: [builtTrace.trace], vias: [builtVia.via] },
+      legality,
+    );
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    insertPcbTrace(tx, designId, builtTrace.trace, timestamp);
+    insertPcbVia(tx, designId, builtVia.via, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      builtVia.via.id,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_commit_route") {
+    if (command.traces.length === 0 && command.vias.length === 0) {
+      return invalidPcbTrace(
+        "pcb_commit_route requires at least one trace or via",
+      );
+    }
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    // Validate-all-then-insert-all: executor branches return error RESULTS
+    // (they don't throw), so inserting before every item is validated would
+    // persist a partial batch inside the committed transaction.
+    const traces: PcbTrace[] = [];
+    for (const traceInput of command.traces) {
+      const built = buildPcbTraceForInsert(traceInput, board);
+      if ("error" in built) return built.error;
+      traces.push(built.trace);
+    }
+    const vias: PcbVia[] = [];
+    const ctx = gate.context();
+    const viaResolver = ctx?.resolver ?? ruleResolverFor(tx, designId, board);
+    for (const viaInput of command.vias) {
+      const built = buildPcbViaForInsert(viaInput, board, viaResolver);
+      if ("error" in built) return built.error;
+      vias.push(built.via);
+    }
+    // The whole batch is one subject set: the session's runs are judged against
+    // each other as well as against the board (contract 07 §4).
+    const legality = commandLegality(command);
+    const verdict = gateCopper(ctx, { traces, vias }, legality);
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    for (const trace of traces) insertPcbTrace(tx, designId, trace, timestamp);
+    for (const via of vias) insertPcbVia(tx, designId, via, timestamp);
+    // Single-id result contract (see pcb_add_trace_via): downstream consumers
+    // derive created copper from history patches, not this id.
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      traces[0]?.id ?? vias[0]?.id ?? null,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_apply_autolayout_candidate") {
+    // ATOMIC by construction: plan everything, write nothing until the whole candidate is
+    // known good. See ./pcb/autolayout-candidate-plan.ts for why validating through the
+    // mutating placement helpers would silently reintroduce partial applies.
+    if (
+      command.placementOperations.length === 0 &&
+      command.routeOperations.length === 0
+    ) {
+      return invalidPcbTrace(
+        "pcb_apply_autolayout_candidate requires at least one operation",
+      );
+    }
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+
+    // 1. placements — composed in operation order onto an in-memory working copy
+    const placementOps: CandidatePlacementOp[] = command.placementOperations.map(
+      (op) => ({ kind: op.type, op }),
+    );
+    const planned = planCandidatePlacements(placementOps, (placementId) =>
+      loadPcbPlacementById(tx, designId, placementId),
+    );
+    if (!planned.ok) {
+      // A missing placement is an expected runtime outcome — the board changed under a
+      // candidate that the staleness digest did not catch (e.g. a component deleted
+      // between digest check and dispatch), so it gets a normal error result.
+      if (planned.error.reason === "unknown_placement") {
+        return pcbPlacementNotFound(planned.error.placementId);
+      }
+      // Everything else (non-cardinal rotation, non-finite position) is rejected by the
+      // route parser before dispatch, so reaching here means a caller bypassed it.
+      // THROWING is deliberate: it aborts the SQLite transaction, where returning an
+      // error result would commit whatever this command had already written. Nothing has
+      // been written yet at this point, but the invariant should not depend on that.
+      throw new Error(
+        `pcb_apply_autolayout_candidate: ${planned.error.reason} — ${planned.error.detail}`,
+      );
+    }
+
+    // 2. copper — built (not inserted) against the same board settings
+    const traces: PcbTrace[] = [];
+    const vias: PcbVia[] = [];
+    const viaResolver = ruleResolverFor(tx, designId, board);
+    for (const op of command.routeOperations) {
+      if (op.type === "pcb_add_trace") {
+        const built = buildPcbTraceForInsert(op, board);
+        if ("error" in built) return built.error;
+        traces.push(built.trace);
+      } else if (op.type === "pcb_add_via") {
+        const built = buildPcbViaForInsert(op, board, viaResolver);
+        if ("error" in built) return built.error;
+        vias.push(built.via);
+      } else {
+        const builtTrace = buildPcbTraceForInsert(op.trace, board);
+        if ("error" in builtTrace) return builtTrace.error;
+        const builtVia = buildPcbViaForInsert(op.via, board, viaResolver);
+        if ("error" in builtVia) return builtVia.error;
+        traces.push(builtTrace.trace);
+        vias.push(builtVia.via);
+      }
+    }
+
+    // 3. write phase — first mutation of the whole command happens here
+    for (const placement of planned.placements) {
+      upsertPcbPlacement(tx, designId, placement, timestamp);
+    }
+    for (const trace of traces) insertPcbTrace(tx, designId, trace, timestamp);
+    for (const via of vias) insertPcbVia(tx, designId, via, timestamp);
+
+    // Single-id result contract (see pcb_commit_route): consumers derive created copper
+    // from history patches, not from this id.
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      traces[0]?.id ?? vias[0]?.id ?? null,
+    );
+  }
+
+  if (command.type === "pcb_delete_trace") {
+    const existing = loadPcbTraceById(tx, designId, command.traceId);
+    if (!existing) return pcbTraceNotFound(command.traceId);
+    deletePcbTrace(tx, command.traceId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_via") {
+    const existing = loadPcbViaById(tx, designId, command.viaId);
+    if (!existing) return pcbViaNotFound(command.viaId);
+    deletePcbVia(tx, command.viaId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_update_trace_geometry") {
+    const existing = loadPcbTraceById(tx, designId, command.traceId);
+    if (!existing) return pcbTraceNotFound(command.traceId);
+    const sanitized = sanitizeTracePath(command.pointsNm);
+    if (sanitized.length < 2) {
+      return invalidPcbTrace("path must have at least 2 distinct points");
+    }
+    const reason = validateTracePath(sanitized, existing.segmentMode);
+    if (reason) return invalidPcbTrace(reason);
+    // No truncation exemption (contract 07 §6, Astra run 1 #2/#3): a vertex
+    // subsequence is not a copper subset, and even a genuine prefix cut can
+    // move a surviving violation's hotspot past its waiver. `replaces` removes
+    // the trace's own row at enumeration, so it is not judged against itself.
+    // The JUDGED trace is the bound row (see `EnvelopeLegality.boundTrace`);
+    // the PERSISTED one is the raw row, which keeps its `netName` hint.
+    const legality = commandLegality(command);
+    const bound = gate.boundTrace(command.traceId) ?? existing;
+    const verdict = gateCopper(
+      gate.context(),
+      { traces: [{ ...bound, pointsNm: sanitized }], vias: [] },
+      legality,
+      [command.traceId],
+    );
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    updatePcbTrace(tx, { ...existing, pointsNm: sanitized }, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      null,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_update_trace") {
+    const existing = loadPcbTraceById(tx, designId, command.traceId);
+    if (!existing) return pcbTraceNotFound(command.traceId);
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const widthMm = command.widthMm ?? existing.widthMm;
+    if (!Number.isFinite(widthMm) || widthMm <= 0) {
+      return invalidPcbTrace("trace width must be positive");
+    }
+    const layer = command.layer ?? existing.layer;
+    if (copperLayerIndex(layer, board.layerCount) === null) {
+      return invalidPcbTrace(
+        `${layer} is not a copper layer of this ${board.layerCount}-layer board`,
+      );
+    }
+    // Judged like a geometry edit: the BOUND row, its own board row replaced.
+    // A too-thin width is `TRACE_WIDTH_MIN`, in the gate's refuse set.
+    const legality = commandLegality(command);
+    const bound = gate.boundTrace(command.traceId) ?? existing;
+    const verdict = gateCopper(
+      gate.context(),
+      { traces: [{ ...bound, widthMm, layer }], vias: [] },
+      legality,
+      [command.traceId],
+    );
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    updatePcbTrace(tx, { ...existing, widthMm, layer }, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      null,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_update_via") {
+    const existing = loadPcbViaById(tx, designId, command.viaId);
+    if (!existing) return pcbViaNotFound(command.viaId);
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const span = resolveUpdatedViaSpan(existing, command, board);
+    if ("error" in span) return span.error;
+    const changes = {
+      diameterMm: command.diameterMm ?? existing.diameterMm,
+      drillMm: command.drillMm ?? existing.drillMm,
+      ...span,
+      protection: command.protection ?? existing.protection,
+    };
+    const sizeError = viaSizeError(
+      {
+        netId: existing.netId,
+        centerMm: existing.centerMm,
+        diameterMm: changes.diameterMm,
+        drillMm: changes.drillMm,
+        layers: viaSpanLayers(span.fromLayer, span.toLayer, board.layerCount),
+      },
+      board,
+      ruleResolverFor(tx, designId, board),
+    );
+    if (sizeError) return sizeError;
+    const legality = commandLegality(command);
+    const bound = gate.boundVia(command.viaId) ?? existing;
+    const verdict = gateCopper(
+      gate.context(),
+      { traces: [], vias: [{ ...bound, ...changes }] },
+      legality,
+      [command.viaId],
+    );
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    updatePcbVia(tx, { ...existing, ...changes }, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      null,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_cleanup_pour_traces") {
+    const proj = loadPcbProjection({ db: tx, designId, revision, timestamp, identityMode });
+    const dr = proj.board.designRules;
+    const padNetIds = new Map(Object.entries(proj.padNets ?? {}));
+    // EVERY effective zone on the trace's layer, board plane and polygon zone
+    // alike (copper-pour contract §9 — widened from S3a's board-only): a trace
+    // buried in an explicit zone's copper is just as redundant as one buried in
+    // a plane, and the S4 rule that a trace must lie strictly inside a SINGLE
+    // island is what keeps the widening conservative.
+    const effectiveZones = collectCopperZones({
+      zones: proj.zones,
+      layerCount: proj.board.layerCount,
+      knownNetIds: new Set(Object.keys(proj.netNames ?? {})),
+    }).zones;
+    // Same keepouts every other fill site subtracts (§13.3): a trace lying in a
+    // `copperPour` keepout is NOT covered by the pour, so it must survive.
+    const { keepouts } = collectKeepouts({
+      keepouts: proj.keepouts ?? [],
+      layerCount: proj.board.layerCount,
+    });
+    // Which of `candidates` a pour covers when the fill is computed with
+    // `removed` already deleted — the fill the board would actually have.
+    const coveredTraces = (
+      removed: ReadonlySet<string>,
+      candidates: ReadonlyArray<PcbTrace>,
+    ): Set<string> => {
+      const fillTraces =
+        removed.size === 0
+          ? proj.traces
+          : proj.traces.filter((trace) => !removed.has(trace.id));
+      const covered = new Set<string>();
+      for (const zone of effectiveZones) {
+        const pourNetId = zone.netId;
+        if (!pourNetId) continue;
+        const fill = buildCopperFillIslands({
+          layerCount: proj.board.layerCount,
+          outline: proj.board.outline,
+          placements: proj.placements,
+          traces: fillTraces,
+          vias: proj.vias,
+          padNetIds,
+          copperToBoardEdgeMm: dr.clearance.copperToBoardEdgeMm,
+          copperToHoleMm: copperToHoleClearanceMm(dr),
+          cutouts: proj.board.cutouts,
+          freeHoles: proj.freeHoles,
+          freePads: proj.freePads,
+          ...pourParamsForZone(
+            zone,
+            dr,
+            keepouts,
+            effectiveZones,
+            zonePourNets(proj.board, proj.netNames ?? {}),
+          ),
+        });
+        // A bailed fill ships no copper (contract §8), so nothing it "covers"
+        // may be deleted — skip the zone rather than reason about `[]`.
+        if (fill.status === "failed" || fill.islands.length === 0) continue;
+        const islands = fill.islands.map((island) => island.rings);
+        for (const trace of candidates) {
+          if (covered.has(trace.id)) continue;
+          if (trace.layer !== zone.layer || trace.netId !== pourNetId) continue;
+          if (isTraceCoveredByPour(trace, islands)) covered.add(trace.id);
+        }
+      }
+      return covered;
+    };
+
+    let toDelete = coveredTraces(new Set(), proj.traces);
+    // The pre-deletion fill is not the fill the board is left with: a trace can
+    // be the only member keeping its own island alive, and with
+    // `islandRemoval: "always"` that island disappears once the trace goes —
+    // deleting trace AND copper. So re-run the fill without the candidates and
+    // keep only those the REMAINING pour still covers. Removing one candidate
+    // can shrink another's island, so iterate to a fixed point; each round can
+    // only drop candidates, so it terminates in at most |candidates| rounds.
+    while (toDelete.size > 0) {
+      const candidates = proj.traces.filter((trace) => toDelete.has(trace.id));
+      const stillCovered = coveredTraces(toDelete, candidates);
+      if (stillCovered.size === toDelete.size) break;
+      toDelete = stillCovered;
+    }
+    for (const id of toDelete) deletePcbTrace(tx, id);
+    return okResult(
+      toDelete.size > 0
+        ? bumpRevision(tx, designId, revision, timestamp)
+        : revision,
+      null,
+    );
+  }
+
+  // ───────── Zones and keepouts (zone/keepout contract §12.2) ─────────
+  if (
+    command.type === "pcb_add_zone" ||
+    command.type === "pcb_update_zone" ||
+    command.type === "pcb_delete_zone" ||
+    command.type === "pcb_add_keepout" ||
+    command.type === "pcb_update_keepout" ||
+    command.type === "pcb_delete_keepout"
+  ) {
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const stackup = copperLayersForCount(board.layerCount);
+
+    if (command.type === "pcb_add_zone") {
+      if (!stackup.includes(command.layer)) {
+        return invalidPcbZone(
+          `layer ${command.layer} is not on the board stackup`,
+        );
+      }
+      let id: string;
+      if (command.region.kind === "board") {
+        // The board-zone id is derived from the layer, never chosen by the
+        // client, so "one board zone per layer" is an id-uniqueness fact.
+        id = boardZoneId(command.layer);
+        if (loadPcbZoneRowById(tx, designId, id)) {
+          return pcbZoneBoardExists(command.layer);
+        }
+      } else {
+        // Outer ring AND cutouts (copper-pour contract §11).
+        const validity = zoneRegionValidity(command.region);
+        if (validity !== "ok") {
+          return invalidPcbZone(`zone outline is invalid (${validity})`);
+        }
+        id = crypto.randomUUID();
+      }
+      const valueError = zoneValueError(command);
+      if (valueError) return invalidPcbZone(valueError);
+      const zone: PcbZone = {
+        id,
+        name: command.name ?? null,
+        enabled: command.enabled ?? true,
+        lockedAt: null,
+        layer: command.layer,
+        netId: emptyToNull(command.net.netId),
+        netName: emptyToNull(command.net.netName),
+        region: copyZoneRegion(command.region),
+        priority: command.priority ?? 0,
+        ...(command.padConnection !== undefined
+          ? { padConnection: command.padConnection }
+          : {}),
+        ...(command.clearanceMm === undefined || command.clearanceMm === null
+          ? {}
+          : { clearanceMm: command.clearanceMm }),
+        ...(command.minWidthMm === undefined || command.minWidthMm === null
+          ? {}
+          : { minWidthMm: command.minWidthMm }),
+        ...(command.thermal === undefined || command.thermal === null
+          ? {}
+          : { thermal: { ...command.thermal } }),
+        ...(command.islandRemoval !== undefined
+          ? { islandRemoval: copyIslandRemoval(command.islandRemoval) }
+          : {}),
+      };
+      insertPcbZone(tx, designId, zone, timestamp);
+      return okResult(bumpRevision(tx, designId, revision, timestamp), zone.id);
+    }
+
+    if (command.type === "pcb_update_zone") {
+      const existing = loadPcbZoneRowById(tx, designId, command.zoneId);
+      if (!existing) return pcbZoneNotFound(command.zoneId);
+      if (existing.zone.lockedAt) {
+        if (command.locked !== false) {
+          return invalidPcbZone("zone is locked — unlock before editing");
+        }
+        if (!unlockOnly(command, "zoneId")) {
+          return invalidPcbZone(
+            "a locked zone accepts only locked: false — unlock first, then edit",
+          );
+        }
+      }
+      const isBoardZone = existing.zone.region.kind === "board";
+      if (
+        isBoardZone &&
+        (command.layer !== undefined || command.region !== undefined)
+      ) {
+        return invalidPcbZone("board zone layer and region are fixed");
+      }
+      if (command.layer !== undefined && !stackup.includes(command.layer)) {
+        return invalidPcbZone(
+          `layer ${command.layer} is not on the board stackup`,
+        );
+      }
+      if (command.region !== undefined) {
+        // A polygon zone can never become a board zone: its id would no longer
+        // be `board:<layer>` and the derivation would drop it fail-closed.
+        if (command.region.kind === "board") {
+          return invalidPcbZone("a polygon zone cannot take a board region");
+        }
+        const validity = zoneRegionValidity(command.region);
+        if (validity !== "ok") {
+          return invalidPcbZone(`zone outline is invalid (${validity})`);
+        }
+      }
+      const valueError = zoneValueError(command);
+      if (valueError) return invalidPcbZone(valueError);
+      const next: PcbZone = { ...existing.zone };
+      if (command.name !== undefined) next.name = command.name;
+      if (command.enabled !== undefined) next.enabled = command.enabled;
+      if (command.layer !== undefined) next.layer = command.layer;
+      if (command.net !== undefined) {
+        next.netId = emptyToNull(command.net.netId);
+        next.netName = emptyToNull(command.net.netName);
+      }
+      if (command.region !== undefined) {
+        next.region = copyZoneRegion(command.region);
+      }
+      if (command.priority !== undefined) next.priority = command.priority;
+      if (command.padConnection !== undefined) {
+        next.padConnection = command.padConnection;
+      }
+      if (command.clearanceMm !== undefined) {
+        if (command.clearanceMm === null) delete next.clearanceMm;
+        else next.clearanceMm = command.clearanceMm;
+      }
+      if (command.minWidthMm !== undefined) {
+        if (command.minWidthMm === null) delete next.minWidthMm;
+        else next.minWidthMm = command.minWidthMm;
+      }
+      if (command.thermal !== undefined) {
+        if (command.thermal === null) delete next.thermal;
+        else next.thermal = { ...command.thermal };
+      }
+      if (command.islandRemoval !== undefined) {
+        if (command.islandRemoval === null) delete next.islandRemoval;
+        else next.islandRemoval = copyIslandRemoval(command.islandRemoval);
+      }
+      if (command.locked !== undefined) {
+        next.lockedAt = command.locked ? timestamp : null;
+      }
+      updatePcbZone(tx, existing.rowId, next, timestamp);
+      return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+    }
+
+    if (command.type === "pcb_delete_zone") {
+      const existing = loadPcbZoneRowById(tx, designId, command.zoneId);
+      if (!existing) return pcbZoneNotFound(command.zoneId);
+      if (existing.zone.lockedAt) {
+        return invalidPcbZone("zone is locked — unlock before deleting");
+      }
+      deletePcbZone(tx, existing.rowId);
+      return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+    }
+
+    if (command.type === "pcb_add_keepout") {
+      const layers = dedupeLayers(command.layers);
+      const layerError = keepoutLayerError(layers, stackup);
+      if (layerError) return invalidPcbKeepout(layerError);
+      const validity = zoneRingValidity(command.pointsMm);
+      if (validity !== "ok") {
+        return invalidPcbKeepout(`keepout outline is invalid (${validity})`);
+      }
+      const keepout: PcbKeepout = {
+        id: crypto.randomUUID(),
+        name: command.name ?? null,
+        enabled: command.enabled ?? true,
+        lockedAt: null,
+        layers,
+        pointsMm: command.pointsMm.map((p) => ({ x: p.x, y: p.y })),
+        restrictions: { ...command.restrictions },
+      };
+      insertPcbKeepout(tx, designId, keepout, timestamp);
+      return okResult(
+        bumpRevision(tx, designId, revision, timestamp),
+        keepout.id,
+      );
+    }
+
+    if (command.type === "pcb_update_keepout") {
+      const existing = loadPcbKeepoutRowById(tx, designId, command.keepoutId);
+      if (!existing) return pcbKeepoutNotFound(command.keepoutId);
+      if (existing.keepout.lockedAt) {
+        if (command.locked !== false) {
+          return invalidPcbKeepout("keepout is locked — unlock before editing");
+        }
+        if (!unlockOnly(command, "keepoutId")) {
+          return invalidPcbKeepout(
+            "a locked keepout accepts only locked: false — unlock first, then edit",
+          );
+        }
+      }
+      let layers: PcbCopperLayerId[] | undefined;
+      if (command.layers !== undefined) {
+        layers = dedupeLayers(command.layers);
+        const layerError = keepoutLayerError(layers, stackup);
+        if (layerError) return invalidPcbKeepout(layerError);
+      }
+      if (command.pointsMm !== undefined) {
+        const validity = zoneRingValidity(command.pointsMm);
+        if (validity !== "ok") {
+          return invalidPcbKeepout(`keepout outline is invalid (${validity})`);
+        }
+      }
+      const next: PcbKeepout = { ...existing.keepout };
+      if (command.name !== undefined) next.name = command.name;
+      if (command.enabled !== undefined) next.enabled = command.enabled;
+      if (layers !== undefined) next.layers = layers;
+      if (command.pointsMm !== undefined) {
+        next.pointsMm = command.pointsMm.map((p) => ({ x: p.x, y: p.y }));
+      }
+      if (command.restrictions !== undefined) {
+        next.restrictions = { ...command.restrictions };
+      }
+      if (command.locked !== undefined) {
+        next.lockedAt = command.locked ? timestamp : null;
+      }
+      updatePcbKeepout(tx, existing.rowId, next, timestamp);
+      return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+    }
+
+    const existing = loadPcbKeepoutRowById(tx, designId, command.keepoutId);
+    if (!existing) return pcbKeepoutNotFound(command.keepoutId);
+    if (existing.keepout.lockedAt) {
+      return invalidPcbKeepout("keepout is locked — unlock before deleting");
+    }
+    deletePcbKeepout(tx, existing.rowId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_set_view_state") {
+    updatePcbViewState({
+      db: tx,
+      designId,
+      patch: command.patch,
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_set_design_rules") {
+    // Validate author intent before even a lazy settings repair can write.
+    const siProblem = validateSiRulesForSave(command);
+    if (siProblem) return invalidPcbBoardSettings(siProblem);
+    const storedClasses = ensurePcbBoardSettings(
+      tx,
+      designId,
+      timestamp,
+    ).netClasses;
+    if (command.netClasses !== undefined) {
+      const problem = validateNetClassesForSave(
+        command.netClasses,
+        storedClasses,
+      );
+      if (problem) return invalidPcbBoardSettings(problem);
+    }
+    if (
+      command.designRules !== undefined ||
+      command.boardThicknessMm !== undefined
+    ) {
+      const problem = validateDesignRulesForSave(
+        command.designRules,
+        command.boardThicknessMm,
+      );
+      if (problem) return invalidPcbBoardSettings(problem);
+    }
+    if (command.drcRules !== undefined) {
+      // Fail CLOSED (rule-semantics contract §2.1): a structurally invalid
+      // rule refuses the WHOLE command and nothing is persisted. Dropping the
+      // row instead would be fail-open — a tightening rule the author wrote
+      // would silently stop enforcing.
+      // Judged against the settings this command WILL persist, not the raw
+      // payload: `designRules` / `netClasses` arrive shape-only from the HTTP
+      // parser, so a partial `{ clearance: { … } }` must be normalised through
+      // the store's own update parse before the compiler sees it.
+      const settings = ensurePcbBoardSettings(tx, designId, timestamp);
+      const { invalid } = validateDrcRulesForSave(command.drcRules, settings, {
+        ...(command.designRules !== undefined
+          ? { designRules: command.designRules }
+          : {}),
+        ...(command.netClasses !== undefined
+          ? { netClasses: command.netClasses }
+          : {}),
+        ...(command.perNetClassAssignments !== undefined
+          ? { perNetClassAssignments: command.perNetClassAssignments }
+          : {}),
+      });
+      const first = invalid[0];
+      if (first) {
+        return invalidDrcRule(first.ruleId, `${first.reason}: ${first.detail}`);
+      }
+    }
+    const next = updatePcbDesignRules({
+      db: tx,
+      designId,
+      designRules: command.designRules,
+      netClasses: command.netClasses,
+      boardThicknessMm: command.boardThicknessMm,
+      perNetClassAssignments: command.perNetClassAssignments,
+      lengthMatchGroups: command.lengthMatchGroups,
+      drcSeverityOverrides: command.drcSeverityOverrides,
+      drcRules: command.drcRules,
+      diffPairs: command.diffPairs,
+      timestamp,
+    });
+    const keptClassIds = new Set(next.netClasses.map((c) => c.id));
+    reassignDeletedNetClassCopper({
+      db: tx,
+      designId,
+      deletedClassIds: new Set(
+        storedClasses.map((c) => c.id).filter((id) => !keptClassIds.has(id)),
+      ),
+      defaultClassId: defaultNetClassId(next.netClasses),
+      timestamp,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_placement") {
+    const existing = loadPcbPlacementById(tx, designId, command.placementId);
+    if (!existing) return pcbPlacementNotFound(command.placementId);
+    deletePcbPlacement(tx, command.placementId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_add_free_hole") {
+    if (!isFinitePoint({ x: command.centerMm.x, y: command.centerMm.y })) {
+      return invalidPcbFreeHole("centerMm must be finite numbers");
+    }
+    if (!(command.drillMm > 0) || !Number.isFinite(command.drillMm)) {
+      return invalidPcbFreeHole("drillMm must be a positive finite number");
+    }
+    const hole = {
+      id: crypto.randomUUID(),
+      centerMm: command.centerMm,
+      drillMm: command.drillMm,
+      lockedAt: null,
+    };
+    insertPcbFreeHole(tx, designId, hole, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), hole.id);
+  }
+
+  if (command.type === "pcb_update_free_hole") {
+    const existing = loadPcbFreeHoleById(tx, designId, command.freeHoleId);
+    if (!existing) return pcbFreeHoleNotFound(command.freeHoleId);
+    if (existing.lockedAt && command.locked !== false) {
+      return invalidPcbFreeHole("free hole is locked — unlock before editing");
+    }
+    if (command.centerMm !== undefined) {
+      if (!isFinitePoint({ x: command.centerMm.x, y: command.centerMm.y })) {
+        return invalidPcbFreeHole("centerMm must be finite numbers");
+      }
+    }
+    if (command.drillMm !== undefined) {
+      if (!(command.drillMm > 0) || !Number.isFinite(command.drillMm)) {
+        return invalidPcbFreeHole("drillMm must be a positive finite number");
+      }
+    }
+    const next = {
+      ...existing,
+      ...(command.centerMm !== undefined ? { centerMm: command.centerMm } : {}),
+      ...(command.drillMm !== undefined ? { drillMm: command.drillMm } : {}),
+      ...(command.locked === undefined
+        ? {}
+        : { lockedAt: command.locked ? timestamp : null }),
+    };
+    updatePcbFreeHole(tx, next, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_free_hole") {
+    const existing = loadPcbFreeHoleById(tx, designId, command.freeHoleId);
+    if (!existing) return pcbFreeHoleNotFound(command.freeHoleId);
+    if (existing.lockedAt) {
+      return invalidPcbFreeHole("free hole is locked — unlock before deleting");
+    }
+    deletePcbFreeHole(tx, command.freeHoleId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_add_free_pad") {
+    if (!isFinitePoint({ x: command.centerMm.x, y: command.centerMm.y })) {
+      return invalidPcbFreePad("centerMm must be finite numbers");
+    }
+    if (!(command.widthMm > 0) || !(command.heightMm > 0)) {
+      return invalidPcbFreePad("widthMm and heightMm must be positive");
+    }
+    const needsDrill = command.padType === "hole" || command.padType === "std";
+    if (needsDrill) {
+      if (
+        command.drillMm === undefined ||
+        !(command.drillMm > 0) ||
+        !Number.isFinite(command.drillMm)
+      ) {
+        return invalidPcbFreePad(
+          `drillMm is required for ${command.padType} pads`,
+        );
+      }
+      if (command.drillMm >= Math.min(command.widthMm, command.heightMm)) {
+        return invalidPcbFreePad("drillMm must be smaller than pad");
+      }
+    }
+    const pad = {
+      id: crypto.randomUUID(),
+      centerMm: command.centerMm,
+      rotationDeg: command.rotationDeg,
+      padType: command.padType,
+      shape: command.shape,
+      widthMm: command.widthMm,
+      // The disc invariant again (contract 10 §7): the HTTP parser normalises
+      // too, but an in-process dispatch must not be able to persist an
+      // unequal circle either.
+      heightMm: command.shape === "circle" ? command.widthMm : command.heightMm,
+      ...(command.roundrectRatio !== undefined
+        ? { roundrectRatio: command.roundrectRatio }
+        : {}),
+      drillMm: needsDrill ? (command.drillMm ?? null) : null,
+      layer: command.layer,
+      netId: command.netId ?? null,
+      solderMaskExpansionMm: command.solderMaskExpansionMm ?? null,
+      solderPasteExpansionMm: command.solderPasteExpansionMm ?? null,
+      lockedAt: null,
+    };
+    insertPcbFreePad(tx, designId, pad, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), pad.id);
+  }
+
+  if (command.type === "pcb_update_free_pad") {
+    const existing = loadPcbFreePadById(tx, designId, command.freePadId);
+    if (!existing) return pcbFreePadNotFound(command.freePadId);
+    if (existing.lockedAt && command.locked !== false) {
+      return invalidPcbFreePad("free pad is locked — unlock before editing");
+    }
+    if (
+      command.centerMm !== undefined &&
+      !isFinitePoint({ x: command.centerMm.x, y: command.centerMm.y })
+    ) {
+      return invalidPcbFreePad("centerMm must be finite numbers");
+    }
+    if (command.widthMm !== undefined && !(command.widthMm > 0)) {
+      return invalidPcbFreePad("widthMm must be positive");
+    }
+    if (command.heightMm !== undefined && !(command.heightMm > 0)) {
+      return invalidPcbFreePad("heightMm must be positive");
+    }
+    const next = {
+      ...existing,
+      ...(command.centerMm !== undefined ? { centerMm: command.centerMm } : {}),
+      ...(command.rotationDeg !== undefined
+        ? { rotationDeg: command.rotationDeg }
+        : {}),
+      ...(command.padType !== undefined ? { padType: command.padType } : {}),
+      ...(command.shape !== undefined ? { shape: command.shape } : {}),
+      ...(command.widthMm !== undefined ? { widthMm: command.widthMm } : {}),
+      ...(command.heightMm !== undefined ? { heightMm: command.heightMm } : {}),
+      ...(command.roundrectRatio !== undefined
+        ? { roundrectRatio: command.roundrectRatio }
+        : {}),
+      ...(command.drillMm !== undefined ? { drillMm: command.drillMm } : {}),
+      ...(command.layer !== undefined ? { layer: command.layer } : {}),
+      ...(command.netId !== undefined ? { netId: command.netId } : {}),
+      ...(command.solderMaskExpansionMm !== undefined
+        ? { solderMaskExpansionMm: command.solderMaskExpansionMm }
+        : {}),
+      ...(command.solderPasteExpansionMm !== undefined
+        ? { solderPasteExpansionMm: command.solderPasteExpansionMm }
+        : {}),
+      ...(command.locked === undefined
+        ? {}
+        : { lockedAt: command.locked ? timestamp : null }),
+    };
+    // A `circle` pad is a DISC of `widthMm` (manufacturability contract 10
+    // §7). The invariant has to hold on the PERSISTED row, so it is resolved
+    // against the MERGED pad: patching the shape to `circle`, or the width of
+    // a pad that already is one, both have to collapse the height.
+    if (next.shape === "circle") next.heightMm = next.widthMm;
+    updatePcbFreePad(tx, next, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_free_pad") {
+    const existing = loadPcbFreePadById(tx, designId, command.freePadId);
+    if (!existing) return pcbFreePadNotFound(command.freePadId);
+    if (existing.lockedAt) {
+      return invalidPcbFreePad("free pad is locked — unlock before deleting");
+    }
+    deletePcbFreePad(tx, command.freePadId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_add_manual_via") {
+    const board = ensurePcbBoardSettings(tx, designId, timestamp);
+    const ctx = gate.context();
+    const built = buildPcbViaForInsert(
+      command,
+      board,
+      ctx?.resolver ?? ruleResolverFor(tx, designId, board),
+    );
+    if ("error" in built) return built.error;
+    // Same builder, same copper, same gate as `pcb_add_via` — only the
+    // provenance differs, and a manually placed via shorts a net just as well.
+    const via = { ...built.via, provenance: "manual" as const };
+    const legality = commandLegality(command);
+    const verdict = gateCopper(ctx, { traces: [], vias: [via] }, legality);
+    const refusal = copperRefusal(verdict, legality);
+    if (refusal) return refusal;
+    insertPcbVia(tx, designId, via, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      via.id,
+      legalityCounts(verdict),
+    );
+  }
+
+  if (command.type === "pcb_add_overlay_text") {
+    if (!isFinitePoint({ x: command.positionMm.x, y: command.positionMm.y })) {
+      return invalidPcbOverlay("positionMm must be finite numbers");
+    }
+    if (!(command.fontSizeMm > 0) || !Number.isFinite(command.fontSizeMm)) {
+      return invalidPcbOverlay("fontSizeMm must be positive");
+    }
+    if (command.text.length === 0) {
+      return invalidPcbOverlay("text must not be empty");
+    }
+    const overlay = {
+      id: crypto.randomUUID(),
+      layer: command.layer,
+      positionMm: command.positionMm,
+      text: command.text,
+      fontSizeMm: command.fontSizeMm,
+      rotationDeg: command.rotationDeg,
+      mirror: command.mirror ?? false,
+      justify: command.justify ?? ("center" as const),
+      lockedAt: null,
+    };
+    insertPcbOverlayText(tx, designId, overlay, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      overlay.id,
+    );
+  }
+
+  if (command.type === "pcb_update_overlay_text") {
+    const existing = loadPcbOverlayTextById(
+      tx,
+      designId,
+      command.overlayTextId,
+    );
+    if (!existing) return pcbOverlayNotFound(command.overlayTextId);
+    if (existing.lockedAt && command.locked !== false) {
+      return invalidPcbOverlay("overlay is locked — unlock before editing");
+    }
+    if (command.fontSizeMm !== undefined && !(command.fontSizeMm > 0)) {
+      return invalidPcbOverlay("fontSizeMm must be positive");
+    }
+    const next = {
+      ...existing,
+      ...(command.layer !== undefined ? { layer: command.layer } : {}),
+      ...(command.positionMm !== undefined
+        ? { positionMm: command.positionMm }
+        : {}),
+      ...(command.text !== undefined ? { text: command.text } : {}),
+      ...(command.fontSizeMm !== undefined
+        ? { fontSizeMm: command.fontSizeMm }
+        : {}),
+      ...(command.rotationDeg !== undefined
+        ? { rotationDeg: command.rotationDeg }
+        : {}),
+      ...(command.mirror !== undefined ? { mirror: command.mirror } : {}),
+      ...(command.justify !== undefined ? { justify: command.justify } : {}),
+      ...(command.locked === undefined
+        ? {}
+        : { lockedAt: command.locked ? timestamp : null }),
+    };
+    updatePcbOverlayText(tx, next, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_overlay_text") {
+    const existing = loadPcbOverlayTextById(
+      tx,
+      designId,
+      command.overlayTextId,
+    );
+    if (!existing) return pcbOverlayNotFound(command.overlayTextId);
+    if (existing.lockedAt) {
+      return invalidPcbOverlay("overlay is locked — unlock before deleting");
+    }
+    deletePcbOverlayText(tx, command.overlayTextId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_add_overlay_shape") {
+    if (command.pointsMm.length < 2) {
+      return invalidPcbOverlay("at least 2 points required");
+    }
+    for (const p of command.pointsMm) {
+      if (!isFinitePoint({ x: p.x, y: p.y })) {
+        return invalidPcbOverlay("pointsMm contain non-finite coordinates");
+      }
+    }
+    if (!(command.strokeWidthMm > 0)) {
+      return invalidPcbOverlay("strokeWidthMm must be positive");
+    }
+    const shape = {
+      id: crypto.randomUUID(),
+      layer: command.layer,
+      kind: command.kind,
+      pointsMm: command.pointsMm,
+      strokeWidthMm: command.strokeWidthMm,
+      fill: command.fill ?? ("none" as const),
+      lockedAt: null,
+    };
+    insertPcbOverlayShape(tx, designId, shape, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), shape.id);
+  }
+
+  if (command.type === "pcb_update_overlay_shape") {
+    const existing = loadPcbOverlayShapeById(
+      tx,
+      designId,
+      command.overlayShapeId,
+    );
+    if (!existing) return pcbOverlayNotFound(command.overlayShapeId);
+    if (existing.lockedAt && command.locked !== false) {
+      return invalidPcbOverlay("overlay is locked — unlock before editing");
+    }
+    if (command.pointsMm !== undefined && command.pointsMm.length < 2) {
+      return invalidPcbOverlay("at least 2 points required");
+    }
+    if (command.strokeWidthMm !== undefined && !(command.strokeWidthMm > 0)) {
+      return invalidPcbOverlay("strokeWidthMm must be positive");
+    }
+    const next = {
+      ...existing,
+      ...(command.layer !== undefined ? { layer: command.layer } : {}),
+      ...(command.kind !== undefined ? { kind: command.kind } : {}),
+      ...(command.pointsMm !== undefined ? { pointsMm: command.pointsMm } : {}),
+      ...(command.strokeWidthMm !== undefined
+        ? { strokeWidthMm: command.strokeWidthMm }
+        : {}),
+      ...(command.fill !== undefined ? { fill: command.fill } : {}),
+      ...(command.locked === undefined
+        ? {}
+        : { lockedAt: command.locked ? timestamp : null }),
+    };
+    updatePcbOverlayShape(tx, next, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "pcb_delete_overlay_shape") {
+    const existing = loadPcbOverlayShapeById(
+      tx,
+      designId,
+      command.overlayShapeId,
+    );
+    if (!existing) return pcbOverlayNotFound(command.overlayShapeId);
+    if (existing.lockedAt) {
+      return invalidPcbOverlay("overlay is locked — unlock before deleting");
+    }
+    deletePcbOverlayShape(tx, command.overlayShapeId);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "duplicate_part") {
+    const source = projection.parts.find((part) => part.id === command.partId);
+    if (!source) return entityNotFound(command.partId, "part");
+    const plan = planDuplicatePart(source, command.positionNm, projection.parts);
+    if (!plan.ok) {
+      return { ok: false, code: "INVALID_PART_POSITION", partId: command.partId, detail: plan.detail };
+    }
+    insertPart(tx, designId, plan.payload, timestamp);
+    return okResult(bumpRevision(tx, designId, revision, timestamp), plan.payload.id);
+  }
+
+  if (command.type === "place_part") {
+    if (!placeComponentDetail) return componentNotFound(command.componentId);
+    const payload = buildPlacePartPayload(
+      placeComponentDetail,
+      command.positionNm,
+      command.rotationDeg ?? 0,
+      command.mirrored ?? false,
+      projection.parts,
+    );
+    insertPart(tx, designId, payload, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      payload.id,
+    );
+  }
+
+  if (command.type === "place_gnd_port") {
+    if (!isFinitePoint(command.positionNm)) {
+      return invalidPrimitive("GND port position must be finite numbers");
+    }
+    const primitive: DesignerPrimitive = {
+      id: crypto.randomUUID(),
+      kind: "gnd",
+      positionNm: command.positionNm,
+      rotationDeg: normalizeRotationDeg(command.rotationDeg ?? 0),
+    };
+    insertPrimitiveRow(tx, designId, primitive, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      primitive.id,
+    );
+  }
+
+  if (command.type === "place_pwr_port") {
+    if (!isFinitePoint(command.positionNm)) {
+      return invalidPrimitive("PWR port position must be finite numbers");
+    }
+    const railText = command.railText.trim();
+    if (railText.length === 0) {
+      return invalidPrimitive("PWR port requires a rail name");
+    }
+    const primitive: DesignerPrimitive = {
+      id: crypto.randomUUID(),
+      kind: "pwr",
+      positionNm: command.positionNm,
+      rotationDeg: normalizeRotationDeg(command.rotationDeg ?? 0),
+      railText,
+    };
+    insertPrimitiveRow(tx, designId, primitive, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      primitive.id,
+    );
+  }
+
+  if (command.type === "place_net_portal") {
+    if (!isFinitePoint(command.positionNm)) {
+      return invalidPrimitive("Net portal position must be finite numbers");
+    }
+    const portalText = command.portalText.trim();
+    if (portalText.length === 0) {
+      return invalidPrimitive("Net portal requires a name");
+    }
+    const primitive: DesignerPrimitive = {
+      id: crypto.randomUUID(),
+      kind: "net_portal",
+      positionNm: command.positionNm,
+      rotationDeg: normalizeRotationDeg(command.rotationDeg ?? 0),
+      portalText,
+    };
+    insertPrimitiveRow(tx, designId, primitive, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      primitive.id,
+    );
+  }
+
+  if (command.type === "move_primitive") {
+    if (!isFinitePoint(command.positionNm)) {
+      return invalidPrimitive("Primitive position must be finite numbers");
+    }
+    const existing = loadPrimitiveById(tx, designId, command.primitiveId);
+    if (!existing) return primitiveNotFound(command.primitiveId);
+    tx.update(schematicPrimitives)
+      .set({
+        positionXNm: command.positionNm.x,
+        positionYNm: command.positionNm.y,
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicPrimitives.id, command.primitiveId))
+      .run();
+    const synthPinId = primitivePinId(command.primitiveId);
+    const nextByPinId = new Map<string, { x: number; y: number }>();
+    nextByPinId.set(synthPinId, { ...command.positionNm });
+    updateConnectedWireGeometry({
+      tx,
+      designId,
+      movedPinIds: [synthPinId],
+      nextByPinId,
+      timestamp,
+      projection,
+    });
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.primitiveId,
+    );
+  }
+
+  if (command.type === "rotate_primitive") {
+    const existing = loadPrimitiveById(tx, designId, command.primitiveId);
+    if (!existing) return primitiveNotFound(command.primitiveId);
+    tx.update(schematicPrimitives)
+      .set({
+        rotationDeg: normalizeRotationDeg(command.rotationDeg),
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicPrimitives.id, command.primitiveId))
+      .run();
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.primitiveId,
+    );
+  }
+
+  if (command.type === "update_primitive_text") {
+    const existing = loadPrimitiveById(tx, designId, command.primitiveId);
+    if (!existing) return primitiveNotFound(command.primitiveId);
+    if (existing.kind === "gnd" || existing.kind === "junction") {
+      return invalidPrimitive(
+        existing.kind === "gnd"
+          ? "GND ports do not have editable text"
+          : "Junction nodes do not have editable text",
+      );
+    }
+    const text = command.text.trim();
+    if (text.length === 0) {
+      return invalidPrimitive("Primitive text must not be empty");
+    }
+    const updated: DesignerPrimitive =
+      existing.kind === "pwr"
+        ? { ...existing, railText: text }
+        : { ...existing, portalText: text };
+    tx.update(schematicPrimitives)
+      .set({
+        payloadJson: serializePrimitivePayload(updated),
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicPrimitives.id, command.primitiveId))
+      .run();
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.primitiveId,
+    );
+  }
+
+  if (command.type === "create_wire") {
+    const sourcePin = resolvePinAny(tx, designId, command.sourcePinId);
+    if (!sourcePin) return pinNotFound(command.sourcePinId);
+    const targetPin = resolvePinAny(tx, designId, command.targetPinId);
+    if (!targetPin) return pinNotFound(command.targetPinId);
+    // Reject a full duplicate: a second wire between the same two pins (either
+    // orientation) is always a fully redundant overlap.
+    const duplicate = tx
+      .select({ id: schematicWires.id })
+      .from(schematicWires)
+      .where(
+        and(
+          eq(schematicWires.designId, designId),
+          or(
+            and(
+              eq(schematicWires.sourcePinId, command.sourcePinId),
+              eq(schematicWires.targetPinId, command.targetPinId),
+            ),
+            and(
+              eq(schematicWires.sourcePinId, command.targetPinId),
+              eq(schematicWires.targetPinId, command.sourcePinId),
+            ),
+          ),
+        ),
+      )
+      .get();
+    if (duplicate) {
+      return invalidWirePath("a wire already connects these two pins");
+    }
+    // No explicit geometry (undefined or empty) → obstacle-aware auto-route.
+    const explicitPoints =
+      command.pointsNm && command.pointsNm.length > 0 ? command.pointsNm : null;
+    const routed = explicitPoints
+      ? null
+      : autoRouteWirePointsDetailed(projection, sourcePin, targetPin);
+    const built = buildCreateWirePayload(
+      sourcePin,
+      targetPin,
+      explicitPoints ?? routed?.points,
+    );
+    if (!built.payload)
+      return invalidWirePath(built.invalidReason ?? "wire path is invalid");
+    if (routed && !routed.clean) {
+      built.payload.routeStatus = "colliding";
+    }
+    insertWire(tx, designId, built.payload, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      built.payload.id,
+    );
+  }
+
+  if (command.type === "create_wire_junction") {
+    const sourcePin = resolvePinAny(tx, designId, command.sourcePinId);
+    if (!sourcePin) return pinNotFound(command.sourcePinId);
+    const wireRow = tx
+      .select()
+      .from(schematicWires)
+      .where(
+        and(
+          eq(schematicWires.designId, designId),
+          eq(schematicWires.id, command.wireId),
+        ),
+      )
+      .get();
+    if (!wireRow) return entityNotFound(command.wireId, "wire");
+
+    const wirePoints = parseWirePointsJson(wireRow.pointsJson);
+    const insertion = insertVertexOnWire(wirePoints, command.targetPointNm);
+    if (!insertion)
+      return invalidWirePath("target wire has no routable segments");
+    const junctionPoint = insertion.points[insertion.insertIndex];
+    if (!junctionPoint) return invalidWirePath("junction insertion failed");
+
+    // Tap landing on the wire's own endpoint → plain pin-to-pin wire to that
+    // endpoint's real pin; no split, no junction node.
+    if (
+      insertion.insertIndex === 0 ||
+      insertion.insertIndex === insertion.points.length - 1
+    ) {
+      const endpointPinId =
+        insertion.insertIndex === 0 ? wireRow.sourcePinId : wireRow.targetPinId;
+      const endpointPin = resolvePinAny(tx, designId, endpointPinId);
+      if (!endpointPin) return pinNotFound(endpointPinId);
+      const endpointBuild = buildCreateWirePayload(
+        sourcePin,
+        endpointPin,
+        command.pointsNm,
+      );
+      if (!endpointBuild.payload)
+        return invalidWirePath(
+          endpointBuild.invalidReason ?? "wire path is invalid",
+        );
+      insertWire(tx, designId, endpointBuild.payload, timestamp);
+      return okResult(
+        bumpRevision(tx, designId, revision, timestamp),
+        endpointBuild.payload.id,
+      );
+    }
+
+    // Split the tapped wire in two at a first-class junction node (audit §4.5)
+    // instead of double-drawing half of it under the new branch. All three
+    // wires terminate on the junction's synthetic `primitive:<id>` pin.
+    const junctionNode: DesignerPrimitive = {
+      id: crypto.randomUUID(),
+      kind: "junction",
+      positionNm: { x: junctionPoint.x, y: junctionPoint.y },
+      rotationDeg: 0,
+    };
+    const junctionPin = primitiveAsPin(junctionNode);
+
+    // Build + validate every payload BEFORE mutating: an invalid result must
+    // not leave a half-split wire behind (the dispatch transaction commits
+    // even for ok:false results).
+    const branchBuild = buildCreateWirePayload(
+      sourcePin,
+      junctionPin,
+      command.pointsNm,
+    );
+    if (!branchBuild.payload)
+      return invalidWirePath(
+        branchBuild.invalidReason ?? "wire path is invalid",
+      );
+    const firstHalfPoints = insertion.points.slice(
+      0,
+      insertion.insertIndex + 1,
+    );
+    const secondHalfPoints = insertion.points.slice(insertion.insertIndex);
+
+    insertPrimitiveRow(tx, designId, junctionNode, timestamp);
+    tx.update(schematicWires)
+      .set({
+        pointsJson: JSON.stringify(firstHalfPoints),
+        targetPinId: junctionPin.id,
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicWires.id, wireRow.id))
+      .run();
+    insertWire(
+      tx,
+      designId,
+      {
+        id: crypto.randomUUID(),
+        sourcePinId: junctionPin.id,
+        targetPinId: wireRow.targetPinId,
+        pointsNm: secondHalfPoints,
+        ...(wireRow.routeStatus === "colliding"
+          ? { routeStatus: "colliding" as const }
+          : {}),
+      },
+      timestamp,
+    );
+    insertWire(tx, designId, branchBuild.payload, timestamp);
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      branchBuild.payload.id,
+    );
+  }
+
+  if (command.type === "update_wire_geometry") {
+    const wireRow = tx
+      .select()
+      .from(schematicWires)
+      .where(
+        and(
+          eq(schematicWires.designId, designId),
+          eq(schematicWires.id, command.wireId),
+        ),
+      )
+      .get();
+    if (!wireRow) return entityNotFound(command.wireId, "wire");
+    const sourcePin = resolvePinAny(tx, designId, wireRow.sourcePinId);
+    if (!sourcePin) return pinNotFound(wireRow.sourcePinId);
+    const targetPin = resolvePinAny(tx, designId, wireRow.targetPinId);
+    if (!targetPin) return pinNotFound(wireRow.targetPinId);
+    // Segment drag never moves the endpoints — force them back onto the pins and
+    // validate the caller-supplied interior geometry is orthogonal + non-overlapping.
+    const normalized = normalizeWirePath(
+      sourcePin.worldPositionNm,
+      targetPin.worldPositionNm,
+      command.pointsNm,
+    );
+    const invalidReason = validateWirePath(normalized);
+    if (invalidReason) return invalidWirePath(invalidReason);
+    tx.update(schematicWires)
+      .set({
+        pointsJson: JSON.stringify(normalized),
+        // A manual drag overrides any auto-router "colliding" flag.
+        routeStatus: null,
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicWires.id, wireRow.id))
+      .run();
+    return okResult(bumpRevision(tx, designId, revision, timestamp), wireRow.id);
+  }
+
+  if (command.type === "auto_arrange_schematic") {
+    applyAutoArrange({
+      tx,
+      designId,
+      projection,
+      timestamp,
+      originNm: command.originNm,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (
+    command.type === "move_part" ||
+    command.type === "rotate_part" ||
+    command.type === "mirror_part"
+  ) {
+    const partId = command.partId;
+    const partRow = tx
+      .select()
+      .from(schematicParts)
+      .where(
+        and(
+          eq(schematicParts.designId, designId),
+          eq(schematicParts.id, partId),
+        ),
+      )
+      .get();
+    if (!partRow) return entityNotFound(partId, "part");
+    const positionNm =
+      command.type === "move_part"
+        ? command.positionNm
+        : { x: partRow.positionXNm, y: partRow.positionYNm };
+    const rotationDeg =
+      command.type === "rotate_part"
+        ? normalizeRotationDeg(command.rotationDeg)
+        : normalizeRotationDeg(partRow.rotationDeg);
+    const mirrored =
+      command.type === "mirror_part"
+        ? command.mirrored
+        : partRow.mirrored === 1;
+    tx.update(schematicParts)
+      .set({
+        positionXNm: positionNm.x,
+        positionYNm: positionNm.y,
+        rotationDeg,
+        mirrored: mirrored ? 1 : 0,
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicParts.id, partId))
+      .run();
+    updatePartPinsAndConnectedWires({
+      tx,
+      designId,
+      partId,
+      positionNm,
+      rotationDeg,
+      mirrored,
+      timestamp,
+      projection,
+    });
+    return okResult(bumpRevision(tx, designId, revision, timestamp), partId);
+  }
+
+  if (command.type === "update_part_properties") {
+    const partRow = tx
+      .select()
+      .from(schematicParts)
+      .where(
+        and(
+          eq(schematicParts.designId, designId),
+          eq(schematicParts.id, command.partId),
+        ),
+      )
+      .get();
+    if (!partRow) return entityNotFound(command.partId, "part");
+
+    const updates: Partial<typeof schematicParts.$inferInsert> = {
+      updatedAt: timestamp,
+    };
+
+    if (command.reference !== undefined) {
+      const trimmed = command.reference.trim();
+      if (trimmed.length === 0) {
+        return invalidPrimitive("reference must not be empty");
+      }
+      const existing = tx
+        .select({ id: schematicParts.id })
+        .from(schematicParts)
+        .where(
+          and(
+            eq(schematicParts.designId, designId),
+            eq(schematicParts.reference, trimmed),
+          ),
+        )
+        .get();
+      if (existing && existing.id !== command.partId) {
+        return duplicateReference(trimmed);
+      }
+      updates.reference = trimmed;
+    }
+
+    if (command.value !== undefined) {
+      updates.value = command.value;
+    }
+
+    if (command.propertiesJson !== undefined) {
+      updates.propertiesJson = JSON.stringify(command.propertiesJson);
+    }
+
+    tx.update(schematicParts)
+      .set(updates)
+      .where(eq(schematicParts.id, command.partId))
+      .run();
+
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.partId,
+    );
+  }
+
+  if (command.type === "update_parts_properties") {
+    const requestedPartIds = [...new Set(command.partIds)];
+    if (requestedPartIds.length === 0) {
+      return entityNotFound("", "part");
+    }
+    const partRows = tx
+      .select()
+      .from(schematicParts)
+      .where(
+        and(
+          eq(schematicParts.designId, designId),
+          inArray(schematicParts.id, requestedPartIds),
+        ),
+      )
+      .all();
+
+    if (partRows.length !== requestedPartIds.length) {
+      const foundIds = new Set(partRows.map((part) => part.id));
+      const missingId = requestedPartIds.find((id) => !foundIds.has(id));
+      return entityNotFound(missingId ?? requestedPartIds[0] ?? "", "part");
+    }
+
+    const updates: Partial<typeof schematicParts.$inferInsert> = {
+      updatedAt: timestamp,
+    };
+
+    if (command.value !== undefined) {
+      updates.value = command.value;
+    }
+
+    if (command.propertiesJson !== undefined) {
+      updates.propertiesJson = JSON.stringify(command.propertiesJson);
+    }
+
+    for (const partRow of partRows) {
+      tx.update(schematicParts)
+        .set(updates)
+        .where(eq(schematicParts.id, partRow.id))
+        .run();
+    }
+
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      requestedPartIds[0] ?? null,
+    );
+  }
+
+  if (command.type === "set_pin_electrical_intent") {
+    const refused = applyPinElectricalIntent({ tx, designId, timestamp, command });
+    if (refused) return refused;
+    return okResult(bumpRevision(tx, designId, revision, timestamp), null);
+  }
+
+  if (command.type === "refresh_part_footprint") {
+    const partIds = [...new Set(command.partIds)];
+    const refused = applyRefreshPartFootprint({
+      tx,
+      designId,
+      timestamp,
+      projection,
+      partIds,
+      details: refreshComponentDetails ?? new Map(),
+    });
+    if (refused) return refused;
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      partIds[0] ?? null,
+    );
+  }
+
+  if (command.type === "delete_entity") {
+    if (command.entityKind === "part") {
+      const part = tx
+        .select({ id: schematicParts.id })
+        .from(schematicParts)
+        .where(
+          and(
+            eq(schematicParts.designId, designId),
+            eq(schematicParts.id, command.entityId),
+          ),
+        )
+        .get();
+      if (!part) return entityNotFound(command.entityId, "part");
+      const pinIds = tx
+        .select({ id: schematicPins.id })
+        .from(schematicPins)
+        .where(eq(schematicPins.partId, command.entityId))
+        .all()
+        .map((pin) => pin.id);
+      if (pinIds.length > 0) {
+        tx.delete(schematicWires)
+          .where(
+            and(
+              eq(schematicWires.designId, designId),
+              or(
+                inArray(schematicWires.sourcePinId, pinIds),
+                inArray(schematicWires.targetPinId, pinIds),
+              ),
+            ),
+          )
+          .run();
+      }
+      tx.delete(schematicPins)
+        .where(eq(schematicPins.partId, command.entityId))
+        .run();
+      tx.delete(schematicParts)
+        .where(eq(schematicParts.id, command.entityId))
+        .run();
+    } else if (command.entityKind === "wire") {
+      const wire = tx
+        .select({ id: schematicWires.id })
+        .from(schematicWires)
+        .where(
+          and(
+            eq(schematicWires.designId, designId),
+            eq(schematicWires.id, command.entityId),
+          ),
+        )
+        .get();
+      if (!wire) return entityNotFound(command.entityId, "wire");
+      tx.delete(schematicWires)
+        .where(eq(schematicWires.id, command.entityId))
+        .run();
+    } else if (command.entityKind === "primitive") {
+      const primitive = tx
+        .select({ id: schematicPrimitives.id })
+        .from(schematicPrimitives)
+        .where(
+          and(
+            eq(schematicPrimitives.designId, designId),
+            eq(schematicPrimitives.id, command.entityId),
+          ),
+        )
+        .get();
+      if (!primitive) return entityNotFound(command.entityId, "primitive");
+      const synthPinId = primitivePinId(command.entityId);
+      tx.delete(schematicWires)
+        .where(
+          and(
+            eq(schematicWires.designId, designId),
+            or(
+              eq(schematicWires.sourcePinId, synthPinId),
+              eq(schematicWires.targetPinId, synthPinId),
+            ),
+          ),
+        )
+        .run();
+      tx.delete(schematicPrimitives)
+        .where(eq(schematicPrimitives.id, command.entityId))
+        .run();
+    } else {
+      const label = tx
+        .select({ id: schematicLabels.id })
+        .from(schematicLabels)
+        .where(
+          and(
+            eq(schematicLabels.designId, designId),
+            eq(schematicLabels.id, command.entityId),
+          ),
+        )
+        .get();
+      if (!label) return entityNotFound(command.entityId, "label");
+      tx.delete(schematicLabels)
+        .where(eq(schematicLabels.id, command.entityId))
+        .run();
+    }
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.entityId,
+    );
+  }
+
+  const text = command.text.trim();
+  if (text.length === 0) return invalidLabel("label text must not be empty");
+  if (command.labelId) {
+    const label = tx
+      .select({ id: schematicLabels.id })
+      .from(schematicLabels)
+      .where(
+        and(
+          eq(schematicLabels.designId, designId),
+          eq(schematicLabels.id, command.labelId),
+        ),
+      )
+      .get();
+    if (!label) return entityNotFound(command.labelId, "label");
+    tx.update(schematicLabels)
+      .set({
+        text,
+        xNm: command.positionNm.x,
+        yNm: command.positionNm.y,
+        updatedAt: timestamp,
+      })
+      .where(eq(schematicLabels.id, command.labelId))
+      .run();
+    return okResult(
+      bumpRevision(tx, designId, revision, timestamp),
+      command.labelId,
+    );
+  }
+
+  const payload: PersistedLabelPayload = {
+    id: crypto.randomUUID(),
+    text,
+    positionNm: command.positionNm,
+  };
+  tx.insert(schematicLabels)
+    .values({
+      id: payload.id,
+      designId,
+      text: payload.text,
+      xNm: payload.positionNm.x,
+      yNm: payload.positionNm.y,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    })
+    .run();
+  return okResult(bumpRevision(tx, designId, revision, timestamp), payload.id);
+}

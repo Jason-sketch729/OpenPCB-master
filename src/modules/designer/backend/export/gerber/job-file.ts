@@ -1,0 +1,109 @@
+import type {
+  DesignerPcbProjection,
+  PcbBoardOutline,
+} from "../../../../../sdks/designer/types";
+import { DEFAULT_BOARD_THICKNESS_MM } from "../../../../../sdks/designer";
+import {
+  exactContour,
+  exactContourBounds,
+} from "../../../../../shared/pcb-geometry/exact-contour";
+
+/**
+ * One entry in the Gerber Job File's `FilesAttributes` array — a manufacturing
+ * file plus its FileFunction / FilePolarity, mirroring the file's own X2 header.
+ */
+export interface GerberJobFileAttr {
+  Path: string;
+  FileFunction: string;
+  FilePolarity: "Positive" | "Negative";
+}
+
+const SOFTWARE = {
+  Vendor: "OpenPCB",
+  Application: "OpenPCB Manufacturing Export",
+  Version: "0.1",
+} as const;
+
+/**
+ * Build the Ucamco Gerber Job File (`.gbrjob`) — a JSON sidecar describing the
+ * layer set, board size/stackup, and every file's FileFunction/FilePolarity.
+ * Fabs (Eurocircuits explicitly) use it to validate stackup completeness and to
+ * detect truncated uploads. Pure/deterministic: same design + date → same bytes.
+ */
+export function buildGerberJobFile(params: {
+  pcb: DesignerPcbProjection;
+  files: readonly GerberJobFileAttr[];
+  createdAt: string;
+  /** Shown to the fab as the project name; the design id when absent/blank. */
+  designName?: string | null;
+}): string {
+  const { pcb, files, createdAt } = params;
+  const projectName = params.designName?.trim() || pcb.designId;
+  const size = outlineSizeMm(pcb.board.outline);
+  const job = {
+    Header: { GenerationSoftware: SOFTWARE, CreationDate: createdAt },
+    GeneralSpecs: {
+      ProjectId: {
+        Name: projectName,
+        // From the id, not the name: a rename must not make it a new project.
+        GUID: deterministicGuid(pcb.designId),
+        Revision: String(pcb.revision),
+      },
+      Size: { X: round3(size.x), Y: round3(size.y) },
+      LayerNumber: pcb.board.layerCount,
+      // The board's OWN thickness — the same value the DRC aspect-ratio check
+      // divides by (manufacturability contract 10 §5.4). It used to report the
+      // 1.6 mm default for every board, so a 0.8 mm or 2.0 mm stackup reached
+      // the fab mislabelled.
+      BoardThickness: round3(
+        pcb.board.boardThicknessMm ?? DEFAULT_BOARD_THICKNESS_MM,
+      ),
+    },
+    FilesAttributes: files.map((file) => ({ ...file })),
+  };
+  return JSON.stringify(job, null, 1) + "\n";
+}
+
+function outlineSizeMm(outline: PcbBoardOutline | null): {
+  x: number;
+  y: number;
+} {
+  if (!outline) return { x: 0, y: 0 };
+  // TRUE arc extrema (exact-geometry contract 12 §6): the chord ring understates
+  // a curved board by up to the chord deviation, and the fab reads this number
+  // as the panel size.
+  const b = exactContourBounds(exactContour(outline));
+  if (!Number.isFinite(b.minX) || !Number.isFinite(b.minY)) {
+    return { x: 0, y: 0 };
+  }
+  return { x: b.maxX - b.minX, y: b.maxY - b.minY };
+}
+
+function round3(n: number): number {
+  return Math.round(n * 1000) / 1000;
+}
+
+/**
+ * Stable RFC-4122-shaped id derived from the design id (FNV-1a, no randomness)
+ * so the same design always emits the same ProjectId GUID — keeps bundles
+ * reproducible without a persisted project GUID.
+ */
+function deterministicGuid(seed: string): string {
+  const words: number[] = [];
+  let h = 0x811c9dc5;
+  for (let w = 0; w < 4; w++) {
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i) + w * 0x01000193;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    words.push(h >>> 0);
+  }
+  const hex = words.map((x) => x.toString(16).padStart(8, "0")).join("");
+  return [
+    hex.slice(0, 8),
+    hex.slice(8, 12),
+    hex.slice(12, 16),
+    hex.slice(16, 20),
+    hex.slice(20, 32),
+  ].join("-");
+}
