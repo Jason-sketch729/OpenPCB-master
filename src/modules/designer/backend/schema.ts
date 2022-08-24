@@ -1,0 +1,577 @@
+import { sql } from "drizzle-orm";
+import {
+  index,
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
+
+export const designHeads = sqliteTable(
+  "designer_design_heads",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    revision: integer("revision").notNull().default(0),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    // Cached compact schematic preview (DesignerSchematicPreview JSON) for
+    // Home-screen thumbnails. Recomputed lazily when its embedded revision
+    // falls behind `revision`.
+    schematicPreviewJson: text("schematic_preview_json"),
+  },
+  (table) => ({
+    nameIdx: index("designer_design_heads_name_idx").on(table.name),
+  }),
+);
+
+export const schematicParts = sqliteTable(
+  "designer_schematic_parts",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    componentId: text("component_id").notNull(),
+    reference: text("reference").notNull(),
+    value: text("value").notNull(),
+    positionXNm: integer("position_x_nm").notNull(),
+    positionYNm: integer("position_y_nm").notNull(),
+    rotationDeg: integer("rotation_deg").notNull().default(0),
+    mirrored: integer("mirrored").notNull().default(0),
+    symbolSnapshotJson: text("symbol_snapshot_json").notNull(),
+    footprintSnapshotJson: text("footprint_snapshot_json").notNull(),
+    propertiesJson: text("properties_json").notNull().default("{}"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_schematic_parts_design_id_idx").on(
+      table.designId,
+    ),
+    designReferenceUq: uniqueIndex("designer_schematic_parts_design_ref_uq").on(
+      table.designId,
+      table.reference,
+    ),
+  }),
+);
+
+export const schematicPins = sqliteTable(
+  "designer_schematic_pins",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    partId: text("part_id").notNull(),
+    originPinKey: text("origin_pin_key").notNull(),
+    number: text("number"),
+    name: text("name").notNull(),
+    electricalType: text("electrical_type").notNull(),
+    electricalIntent: text("electrical_intent"),
+    unit: integer("unit").notNull(),
+    localXNm: integer("local_x_nm").notNull(),
+    localYNm: integer("local_y_nm").notNull(),
+    worldXNm: integer("world_x_nm").notNull(),
+    worldYNm: integer("world_y_nm").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_schematic_pins_design_id_idx").on(
+      table.designId,
+    ),
+    partIdIdx: index("designer_schematic_pins_part_id_idx").on(table.partId),
+    partOriginKeyUq: uniqueIndex(
+      "designer_schematic_pins_part_origin_key_uq",
+    ).on(table.partId, table.originPinKey),
+  }),
+);
+
+export const schematicWires = sqliteTable(
+  "designer_schematic_wires",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    sourcePinId: text("source_pin_id").notNull(),
+    targetPinId: text("target_pin_id").notNull(),
+    pointsJson: text("points_json").notNull(),
+    // "colliding" when the auto-router committed its known-colliding fallback
+    // (audit §4.4); NULL for clean or user-drawn geometry.
+    routeStatus: text("route_status"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_schematic_wires_design_id_idx").on(
+      table.designId,
+    ),
+    sourcePinIdx: index("designer_schematic_wires_source_pin_idx").on(
+      table.sourcePinId,
+    ),
+    targetPinIdx: index("designer_schematic_wires_target_pin_idx").on(
+      table.targetPinId,
+    ),
+  }),
+);
+
+export const schematicLabels = sqliteTable(
+  "designer_schematic_labels",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    text: text("text").notNull(),
+    xNm: integer("x_nm").notNull(),
+    yNm: integer("y_nm").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_schematic_labels_design_id_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+export const schematicPrimitives = sqliteTable(
+  "designer_schematic_primitives",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    kind: text("kind").notNull(),
+    positionXNm: integer("position_x_nm").notNull(),
+    positionYNm: integer("position_y_nm").notNull(),
+    rotationDeg: integer("rotation_deg").notNull().default(0),
+    payloadJson: text("payload_json").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_schematic_primitives_design_id_idx").on(
+      table.designId,
+    ),
+    designKindIdx: index("designer_schematic_primitives_design_kind_idx").on(
+      table.designId,
+      table.kind,
+    ),
+  }),
+);
+
+export const pcbEntities = sqliteTable(
+  "designer_pcb_entities",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    kind: text("kind").notNull(),
+    payloadJson: text("payload_json").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_pcb_entities_design_id_idx").on(
+      table.designId,
+    ),
+    designKindIdx: index("designer_pcb_entities_design_kind_idx").on(
+      table.designId,
+      table.kind,
+    ),
+  }),
+);
+
+export const commandLog = sqliteTable(
+  "designer_command_log",
+  {
+    commandId: text("command_id").primaryKey(),
+    designId: text("design_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    commandType: text("command_type").notNull(),
+    commandJson: text("command_json").notNull(),
+    resultJson: text("result_json").notNull(),
+    operationIdentityJson: text("operation_identity_json"),
+    actorScope: text("actor_scope"),
+    operationId: text("operation_id"),
+    issuedAt: integer("issued_at").notNull(),
+    appliedRevision: integer("applied_revision").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    designIdIdx: index("designer_command_log_design_id_idx").on(table.designId),
+    operationIdx: index("designer_command_log_operation_idx").on(
+      table.actorScope,
+      table.operationId,
+    ),
+  }),
+);
+
+export const sessionHistories = sqliteTable(
+  "designer_session_histories",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    sessionId: text("session_id").notNull(),
+    undoStackJson: text("undo_stack_json").notNull(),
+    redoStackJson: text("redo_stack_json").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designSessionUq: uniqueIndex(
+      "designer_session_histories_design_session_uq",
+    ).on(table.designId, table.sessionId),
+    designIdIdx: index("designer_session_histories_design_id_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+export const designCreationReceipts = sqliteTable(
+  "designer_design_creation_receipts",
+  {
+    actionId: text("action_id").notNull(),
+    actorScope: text("actor_scope").notNull(),
+    operationId: text("operation_id").notNull(),
+    identityJson: text("identity_json").notNull(),
+    inputJson: text("input_json").notNull(),
+    designJson: text("design_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => ({
+    identityPk: primaryKey({ columns: [table.actorScope, table.actionId] }),
+    operationIdx: index("designer_design_creation_receipts_operation_idx").on(table.actorScope, table.operationId),
+  }),
+);
+
+export const cloudLink = sqliteTable("designer_cloud_link", {
+  designId: text("design_id").primaryKey(),
+  cloudDesignId: text("cloud_design_id").notNull(),
+  cloudWorkspaceId: text("cloud_workspace_id").notNull(),
+  cloudUserId: text("cloud_user_id").notNull(),
+  lastSyncedRevision: integer("last_synced_revision").notNull().default(-1),
+  linkedAt: text("linked_at").notNull(),
+  failedAttempts: integer("failed_attempts").notNull().default(0),
+  lastError: text("last_error"),
+});
+
+export const bomOverrides = sqliteTable(
+  "designer_bom_overrides",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    // Identity of a bound override (migration 0019); refdes is the reference
+    // at the last write and the match key only while part_id is null.
+    partId: text("part_id"),
+    refdes: text("refdes").notNull(),
+    manufacturer: text("manufacturer"),
+    manufacturerPartNumber: text("manufacturer_part_number"),
+    lcscPartNumber: text("lcsc_part_number"),
+    supplier: text("supplier"),
+    unitPriceMicros: integer("unit_price_micros"),
+    currency: text("currency"),
+    dnp: integer("dnp").notNull().default(0),
+    assemblySide: text("assembly_side"),
+    notes: text("notes"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designPartUq: uniqueIndex("designer_bom_overrides_design_part_uq").on(
+      table.designId,
+      table.partId,
+    ),
+    designRefUnboundUq: uniqueIndex(
+      "designer_bom_overrides_design_ref_unbound_uq",
+    )
+      .on(table.designId, table.refdes)
+      .where(sql`${table.partId} is null`),
+    designIdIdx: index("designer_bom_overrides_design_id_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+// Latest persisted DRC result per design (one row, upserted on every run).
+// `ranAtRevision` vs `designHeads.revision` drives the stale badge.
+export const drcResults = sqliteTable("designer_drc_results", {
+  designId: text("design_id").primaryKey(),
+  ranAtRevision: integer("ran_at_revision").notNull(),
+  ranAt: text("ran_at").notNull(),
+  errorCount: integer("error_count").notNull(),
+  warningCount: integer("warning_count").notNull(),
+  infoCount: integer("info_count").notNull(),
+  violationsJson: text("violations_json").notNull(),
+  optionsJson: text("options_json").notNull().default("{}"),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const commentThreads = sqliteTable(
+  "designer_comment_threads",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    surface: text("surface").notNull(),
+    anchorJson: text("anchor_json"),
+    status: text("status").notNull().default("open"),
+    todoStatus: text("todo_status").notNull().default("none"),
+    title: text("title"),
+    createdBy: text("created_by"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    lastMessageAt: text("last_message_at"),
+    messageCount: integer("message_count").notNull().default(0),
+    revision: integer("revision").notNull().default(0),
+    syncState: text("sync_state").notNull().default("local"),
+    deletedAt: text("deleted_at"),
+  },
+  (table) => ({
+    designIdIdx: index("designer_comment_threads_design_id_idx").on(
+      table.designId,
+    ),
+    designSurfaceIdx: index("designer_comment_threads_design_surface_idx").on(
+      table.designId,
+      table.surface,
+    ),
+  }),
+);
+
+export const commentMessages = sqliteTable(
+  "designer_comment_messages",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    kind: text("kind").notNull().default("user"),
+    body: text("body"),
+    mentionsJson: text("mentions_json").notNull().default("[]"),
+    createdBy: text("created_by"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    editedAt: text("edited_at"),
+    deletedAt: text("deleted_at"),
+    revision: integer("revision").notNull().default(0),
+  },
+  (table) => ({
+    threadIdIdx: index("designer_comment_messages_thread_id_idx").on(
+      table.threadId,
+    ),
+    designIdIdx: index("designer_comment_messages_design_id_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+export const commentAttachments = sqliteTable(
+  "designer_comment_attachments",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    messageId: text("message_id"),
+    fileName: text("file_name").notNull(),
+    mimeType: text("mime_type").notNull(),
+    byteSize: integer("byte_size").notNull(),
+    localPath: text("local_path"),
+    storageKey: text("storage_key"),
+    createdAt: text("created_at").notNull(),
+    deletedAt: text("deleted_at"),
+  },
+  (table) => ({
+    threadIdIdx: index("designer_comment_attachments_thread_id_idx").on(
+      table.threadId,
+    ),
+    messageIdIdx: index("designer_comment_attachments_message_id_idx").on(
+      table.messageId,
+    ),
+  }),
+);
+
+export const commentReactions = sqliteTable(
+  "designer_comment_reactions",
+  {
+    id: text("id").primaryKey(),
+    designId: text("design_id").notNull(),
+    threadId: text("thread_id").notNull(),
+    messageId: text("message_id").notNull(),
+    emoji: text("emoji").notNull(),
+    createdBy: text("created_by"),
+    createdAt: text("created_at").notNull(),
+    deletedAt: text("deleted_at"),
+  },
+  (table) => ({
+    messageIdIdx: index("designer_comment_reactions_message_id_idx").on(
+      table.messageId,
+    ),
+    threadIdIdx: index("designer_comment_reactions_thread_id_idx").on(
+      table.threadId,
+    ),
+  }),
+);
+
+export const commentOutbox = sqliteTable(
+  "designer_comment_outbox",
+  {
+    commandId: text("command_id").primaryKey(),
+    designId: text("design_id").notNull(),
+    threadId: text("thread_id"),
+    baseRevision: integer("base_revision"),
+    commandType: text("command_type").notNull(),
+    commandJson: text("command_json").notNull(),
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    lastError: text("last_error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    syncedAt: text("synced_at"),
+  },
+  (table) => ({
+    statusIdx: index("designer_comment_outbox_status_idx").on(table.status),
+    designIdIdx: index("designer_comment_outbox_design_id_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+// --- Dataset capture (WP-D4, migration 0017) ---------------------------------
+
+export const captureSessions = sqliteTable(
+  "designer_capture_sessions",
+  {
+    sessionUlid: text("session_ulid").primaryKey(),
+    designId: text("design_id").notNull(),
+    startedAt: text("started_at").notNull(),
+    endedAt: text("ended_at"),
+    logDir: text("log_dir").notNull(),
+    seq: integer("seq").notNull().default(0),
+    commandsSinceSnapshot: integer("commands_since_snapshot")
+      .notNull()
+      .default(0),
+    bytesOnDisk: integer("bytes_on_disk").notNull().default(0),
+    capped: integer("capped").notNull().default(0),
+  },
+  (table) => ({
+    designIdIdx: index("designer_capture_sessions_design_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+export const captureAutolayoutJobs = sqliteTable(
+  "designer_capture_autolayout_jobs",
+  {
+    jobId: text("job_id").primaryKey(),
+    designId: text("design_id").notNull(),
+    appliedCandidateId: text("applied_candidate_id"),
+    captureSessionUlid: text("capture_session_ulid").notNull(),
+    appliedAt: text("applied_at").notNull(),
+    snapshotHash: text("snapshot_hash"),
+    engineVersion: text("engine_version"),
+    resultSummaryJson: text("result_summary_json"),
+    preexistingNetCopperJson: text("preexisting_net_copper_json")
+      .notNull()
+      .default("{}"),
+  },
+  (table) => ({
+    designIdIdx: index("designer_capture_autolayout_jobs_design_idx").on(
+      table.designId,
+    ),
+  }),
+);
+
+export const captureAutoCopper = sqliteTable(
+  "designer_capture_auto_copper",
+  {
+    geometryId: text("geometry_id").primaryKey(),
+    designId: text("design_id").notNull(),
+    kind: text("kind").notNull(), // 'trace' | 'via'
+    netId: text("net_id"),
+    jobId: text("job_id").notNull(),
+    appliedCandidateId: text("applied_candidate_id"),
+    createdByCommandId: text("created_by_command_id").notNull(),
+    // 'active' | 'modified' | 'deleted' | 'undone'
+    status: text("status").notNull().default("active"),
+    touchesJson: text("touches_json").notNull().default("[]"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    designNetIdx: index("designer_capture_auto_copper_design_net_idx").on(
+      table.designId,
+      table.netId,
+    ),
+    cmdIdx: index("designer_capture_auto_copper_cmd_idx").on(
+      table.createdByCommandId,
+    ),
+  }),
+);
+
+export const captureUploadQueue = sqliteTable(
+  "designer_capture_upload_queue",
+  {
+    id: text("id").primaryKey(), // ULID
+    kind: text("kind").notNull(), // 'events' | 'board'
+    payloadPath: text("payload_path").notNull(),
+    designId: text("design_id"),
+    sessionUlid: text("session_ulid"),
+    // 'pending' | 'inflight' | 'done' | 'failed'
+    status: text("status").notNull().default("pending"),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: text("next_attempt_at"),
+    lastError: text("last_error"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => ({
+    statusIdx: index("designer_capture_upload_queue_status_idx").on(
+      table.status,
+      table.nextAttemptAt,
+    ),
+  }),
+);
+
+export const netIdentityState = sqliteTable("designer_net_identity_state", {
+  designId: text("design_id").primaryKey().notNull(),
+  schemaVersion: integer("schema_version").notNull(),
+  status: text("status").notNull(),
+  nextSeq: integer("next_seq").notNull(),
+  activeJson: text("active_json").notNull(),
+  provenanceJson: text("provenance_json").notNull(),
+  lastError: text("last_error"),
+  updatedAt: text("updated_at").notNull(),
+});
+
+export const netIdentityRetired = sqliteTable("designer_net_identity_retired", {
+  designId: text("design_id").notNull(),
+  netId: text("net_id").notNull(),
+  seq: integer("seq").notNull(),
+  reason: text("reason").notNull(),
+  successorIdsJson: text("successor_ids_json").notNull(),
+  displayName: text("display_name"),
+  retiredAtRevision: integer("retired_at_revision").notNull(),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+}, (table) => ({
+  identityPk: primaryKey({ columns: [table.designId, table.netId] }),
+  seqIdx: index("designer_net_identity_retired_seq_idx").on(table.designId, table.seq),
+}));
+
+export const netIdentityQuarantine = sqliteTable("designer_net_identity_quarantine", {
+  designId: text("design_id").notNull(),
+  refKind: text("ref_kind").notNull(),
+  refId: text("ref_id").notNull(),
+  legacyValue: text("legacy_value").notNull(),
+  reason: text("reason").notNull(),
+  candidatesJson: text("candidates_json").notNull(),
+  suggestedNetId: text("suggested_net_id"),
+  createdAt: text("created_at").notNull(),
+}, (table) => ({
+  referencePk: primaryKey({
+    columns: [table.designId, table.refKind, table.refId, table.legacyValue],
+  }),
+}));
+
+export const netIdentityBackups = sqliteTable("designer_net_identity_backups", {
+  designId: text("design_id").notNull(),
+  schemaVersion: integer("schema_version").notNull(),
+  revision: integer("revision").notNull(),
+  payloadJson: text("payload_json").notNull(),
+  sha256: text("sha256").notNull(),
+  createdAt: text("created_at").notNull(),
+}, (table) => ({
+  backupPk: primaryKey({ columns: [table.designId, table.schemaVersion] }),
+}));

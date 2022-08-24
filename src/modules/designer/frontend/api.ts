@@ -1,0 +1,918 @@
+import type {
+  DesignerCommandEnvelope,
+  DesignerCommentAttachment,
+  DesignerCommentCommandEnvelope,
+  DesignerCommentCommandResult,
+  DesignerCommentSurface,
+  DesignerCommentThread,
+  BomOverride,
+  BomOverridePatch,
+  BomProjection,
+  DesignerDesignSummary,
+  DesignerDispatchResult,
+  DesignerHistoryActionResult,
+  DesignerHistorySnapshot,
+  DesignerNetIdentityStatus,
+  DesignerPcbProjection,
+  DesignerSchematicProjection,
+  DrcReport,
+  DrcRunSnapshot,
+  ErcReport,
+  KicadProjectCommitResult,
+  KicadProjectInspectReport,
+  LibraryComponent,
+  LibraryComponentPlacementDetail,
+  LibraryTagStat,
+  PlaceOperation,
+  PlaceOptions,
+  PlaceStatusResponse,
+  RouteOperation,
+  RouteOptions,
+  RouteStatusResponse,
+  SubmitPlaceResponse,
+  SubmitRouteResponse,
+} from "../../../sdks";
+import { exportBundleName } from "../../../sdks";
+
+export interface ExportSummaryFile {
+  kind: string;
+  fileName: string;
+  bytes: number;
+}
+
+/** Lightweight export preview: file list + preflight warnings, no file text. */
+export interface ExportSummary {
+  bundleName: string;
+  warnings: string[];
+  files: ExportSummaryFile[];
+}
+
+export interface GerberExportRequestOptions {
+  includeBom?: boolean;
+  includePickAndPlace?: boolean;
+  includeInnerLayers?: boolean;
+}
+
+function buildModuleUrl(
+  backendURL: string | null | undefined,
+  moduleId: string,
+  path: string,
+): string {
+  if (!backendURL) {
+    throw new Error("Backend URL unavailable");
+  }
+  return `${backendURL}/api/modules/${moduleId}${path}`;
+}
+
+function downloadBlob(blob: Blob, fileName: string): void {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = fileName;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+export interface DesignerApiProblem {
+  type: string;
+  title: string;
+  status: number;
+  detail?: string;
+  instance?: string;
+  [key: string]: unknown;
+}
+
+/** Preserve machine-readable refusal details without changing message consumers. */
+export class DesignerApiProblemError extends Error {
+  readonly code: string | undefined;
+  constructor(readonly status: number, readonly problem: DesignerApiProblem) {
+    super(problem.detail ?? problem.title ?? `HTTP ${status}`);
+    this.name = "DesignerApiProblemError";
+    this.code = typeof problem.code === "string" ? problem.code : undefined;
+  }
+}
+
+async function fetchData<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
+  if (!response.ok) {
+    const contentType = response.headers.get("content-type") ?? "";
+    if (contentType.includes("application/problem+json")) {
+      const problem = (await response.json()) as DesignerApiProblem;
+      throw new DesignerApiProblemError(response.status, problem);
+    }
+    throw new Error(`HTTP ${response.status}`);
+  }
+  const payload = (await response.json()) as { data?: T };
+  if (!payload.data) {
+    throw new Error("Missing response payload");
+  }
+  return payload.data;
+}
+
+export interface CloudHeadersProvider {
+  (): { "x-cloud-bearer"?: string; "x-cloud-api-url"?: string };
+}
+
+export function createDesignerApi(params: {
+  backendURL?: string | null;
+  moduleId: string;
+  cloudHeaders?: CloudHeadersProvider;
+}) {
+  const { backendURL, moduleId, cloudHeaders } = params;
+
+  function applyCloudHeaders(init: HeadersInit | undefined): HeadersInit {
+    const headers = new Headers(init);
+    const ch = cloudHeaders?.();
+    if (ch?.["x-cloud-bearer"]) {
+      headers.set("x-cloud-bearer", ch["x-cloud-bearer"]);
+    }
+    if (ch?.["x-cloud-api-url"]) {
+      headers.set("x-cloud-api-url", ch["x-cloud-api-url"]);
+    }
+    return headers;
+  }
+
+  return {
+    async listDesigns(): Promise<DesignerDesignSummary[]> {
+      const data = await fetchData<{ designs: DesignerDesignSummary[] }>(
+        buildModuleUrl(backendURL, moduleId, "/designs"),
+      );
+      return data.designs;
+    },
+
+    /**
+     * Tell the backend which design the UI has focused. External drivers (the
+     * MCP server) read this as their default target — see
+     * `src/modules/designer/backend/active-design.ts`. Fire-and-forget: a
+     * failure here must never disturb tab switching.
+     */
+    async setActiveDesign(designId: string | null): Promise<void> {
+      await fetchData<{ designId: string | null }>(
+        buildModuleUrl(backendURL, moduleId, "/active-design"),
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ designId }),
+        },
+      );
+    },
+
+    async createDesign(name?: string): Promise<DesignerDesignSummary> {
+      const data = await fetchData<{ design: DesignerDesignSummary }>(
+        buildModuleUrl(backendURL, moduleId, "/designs"),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(name ? { name } : {}),
+        },
+      );
+      return data.design;
+    },
+
+    async updateDesign(
+      designId: string,
+      input: { name: string },
+    ): Promise<DesignerDesignSummary> {
+      const data = await fetchData<{ design: DesignerDesignSummary }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}`,
+        ),
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(input),
+        },
+      );
+      return data.design;
+    },
+
+    async deleteDesign(designId: string): Promise<void> {
+      const url = buildModuleUrl(
+        backendURL,
+        moduleId,
+        `/designs/${encodeURIComponent(designId)}`,
+      );
+      const response = await fetch(url, { method: "DELETE" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+    },
+
+    async getSchematicProjection(
+      designId: string,
+    ): Promise<DesignerSchematicProjection> {
+      const data = await fetchData<{ projection: DesignerSchematicProjection }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/projection/schematic`,
+        ),
+      );
+      return data.projection;
+    },
+
+    async getPcbProjection(designId: string): Promise<DesignerPcbProjection> {
+      const data = await fetchData<{ projection: DesignerPcbProjection }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/projection/pcb`,
+        ),
+      );
+      return data.projection;
+    },
+
+    async getNetIdentity(designId: string): Promise<DesignerNetIdentityStatus> {
+      return fetchData<DesignerNetIdentityStatus>(buildModuleUrl(backendURL, moduleId,
+        `/designs/${encodeURIComponent(designId)}/net-identity`));
+    },
+
+    async migrateNetIdentity(designId: string): Promise<DesignerNetIdentityStatus> {
+      return fetchData<DesignerNetIdentityStatus>(buildModuleUrl(backendURL, moduleId,
+        `/designs/${encodeURIComponent(designId)}/net-identity/migrate`), { method: "POST" });
+    },
+
+    async restoreNetIdentity(designId: string, confirmDiscardRevisions = false): Promise<DesignerNetIdentityStatus> {
+      return fetchData<DesignerNetIdentityStatus>(buildModuleUrl(backendURL, moduleId,
+        `/designs/${encodeURIComponent(designId)}/net-identity/restore-legacy`), {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ confirmDiscardRevisions }),
+      });
+    },
+
+    async listCommentThreads(
+      designId: string,
+      surface?: DesignerCommentSurface,
+    ): Promise<DesignerCommentThread[]> {
+      const suffix = surface ? `?surface=${encodeURIComponent(surface)}` : "";
+      const data = await fetchData<{ threads: DesignerCommentThread[] }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/comments${suffix}`,
+        ),
+        { headers: applyCloudHeaders(undefined) },
+      );
+      return data.threads;
+    },
+
+    async getCommentThread(
+      designId: string,
+      threadId: string,
+      viewer?: string | null,
+    ): Promise<DesignerCommentThread> {
+      const suffix = viewer ? `?viewer=${encodeURIComponent(viewer)}` : "";
+      const data = await fetchData<{ thread: DesignerCommentThread }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/comments/${encodeURIComponent(threadId)}${suffix}`,
+        ),
+        { headers: applyCloudHeaders(undefined) },
+      );
+      return data.thread;
+    },
+
+    /** Direct URL for an image attachment (served by the local backend). */
+    commentAttachmentUrl(designId: string, attachmentId: string): string {
+      return buildModuleUrl(
+        backendURL,
+        moduleId,
+        `/designs/${encodeURIComponent(designId)}/comments/attachments/${encodeURIComponent(attachmentId)}`,
+      );
+    },
+
+    async dispatchCommentCommand(
+      designId: string,
+      envelope: DesignerCommentCommandEnvelope,
+    ): Promise<DesignerCommentCommandResult> {
+      const data = await fetchData<{ result: DesignerCommentCommandResult }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/comments/commands`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(envelope),
+        },
+      );
+      return data.result;
+    },
+
+    async uploadCommentScreenshot(
+      designId: string,
+      input: {
+        threadId: string;
+        messageId?: string | null;
+        fileName: string;
+        mimeType: string;
+        base64: string;
+      },
+    ): Promise<DesignerCommentAttachment> {
+      const data = await fetchData<{ attachment: DesignerCommentAttachment }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/comments/attachments`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(input),
+        },
+      );
+      return data.attachment;
+    },
+
+    /**
+     * Run ERC over the current schematic projection. The backend computes it
+     * on demand and persists nothing, so there is no companion getter.
+     */
+    async runErc(designId: string): Promise<ErcReport> {
+      const data = await fetchData<{ report: ErcReport }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/erc`,
+        ),
+      );
+      return data.report;
+    },
+
+    /** Compute + persist DRC, returning the fresh report. */
+    async runDrc(designId: string): Promise<DrcReport> {
+      const data = await fetchData<{ report: DrcReport }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/drc/run`,
+        ),
+        { method: "POST" },
+      );
+      return data.report;
+    },
+
+    /** Latest persisted DRC report, or null if never run. */
+    async getDrcResult(designId: string): Promise<DrcReport | null> {
+      const data = await fetchData<{ report: DrcReport | null }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/drc`,
+        ),
+      );
+      return data.report;
+    },
+
+    /**
+     * Start — or join — the asynchronous batch DRC run for a design
+     * (execution contract 09 §7). Returns the run's first snapshot; the
+     * report itself never travels with a run and is fetched with
+     * `getDrcResult` once the run completes.
+     */
+    async startDrcRun(designId: string): Promise<DrcRunSnapshot> {
+      return fetchData<DrcRunSnapshot>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/drc/runs`,
+        ),
+        { method: "POST" },
+      );
+    },
+
+    /** Poll one run's snapshot. Rejects (404) once the run has been dropped. */
+    async getDrcRun(designId: string, runId: string): Promise<DrcRunSnapshot> {
+      return fetchData<DrcRunSnapshot>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/drc/runs/${encodeURIComponent(runId)}`,
+        ),
+      );
+    },
+
+    /**
+     * Request cancellation. Cooperative: the returned snapshot may still be
+     * `running` — the stream (or the poll fallback) reports the terminal state.
+     */
+    async cancelDrcRun(
+      designId: string,
+      runId: string,
+    ): Promise<DrcRunSnapshot> {
+      return fetchData<DrcRunSnapshot>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/drc/runs/${encodeURIComponent(runId)}/cancel`,
+        ),
+        { method: "POST" },
+      );
+    },
+
+    /** SSE endpoint for a run's lifecycle events. Loopback; no headers. */
+    drcRunStreamUrl(designId: string, runId: string): string {
+      return buildModuleUrl(
+        backendURL,
+        moduleId,
+        `/designs/${encodeURIComponent(designId)}/drc/runs/${encodeURIComponent(runId)}/stream`,
+      );
+    },
+
+    async getBom(designId: string): Promise<BomProjection> {
+      const data = await fetchData<{ bom: BomProjection }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/bom`,
+        ),
+      );
+      return data.bom;
+    },
+
+    async updateBomOverride(
+      designId: string,
+      refdes: string,
+      patch: BomOverridePatch,
+    ): Promise<{ override: BomOverride; bom: BomProjection | null }> {
+      return fetchData<{ override: BomOverride; bom: BomProjection | null }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/bom/refs/${encodeURIComponent(refdes)}`,
+        ),
+        {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(patch),
+        },
+      );
+    },
+
+    async searchComponents(
+      query: string,
+      limit = 30,
+      tags: readonly string[] = [],
+    ): Promise<LibraryComponent[]> {
+      const params = new URLSearchParams();
+      if (query.length > 0) params.set("q", query);
+      params.set("limit", String(limit));
+      if (tags.length > 0) params.set("tags", tags.join(","));
+      const data = await fetchData<{ components: LibraryComponent[] }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/library/components?${params.toString()}`,
+        ),
+      );
+      return data.components;
+    },
+
+    async resolvePlacement(
+      componentId: string,
+    ): Promise<LibraryComponentPlacementDetail> {
+      const data = await fetchData<{ detail: LibraryComponentPlacementDetail }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/library/components/${encodeURIComponent(componentId)}/placement`,
+        ),
+      );
+      return data.detail;
+    },
+
+    async fetchLibraryTags(
+      options: { excludeSystem?: boolean } = {},
+    ): Promise<LibraryTagStat[]> {
+      const params = new URLSearchParams();
+      if (options.excludeSystem) params.set("excludeSystem", "true");
+      const data = await fetchData<{ tags: LibraryTagStat[] }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          params.toString().length > 0
+            ? `/library/tags?${params.toString()}`
+            : "/library/tags",
+        ),
+      );
+      return data.tags;
+    },
+
+    async dispatch(
+      designId: string,
+      envelope: DesignerCommandEnvelope,
+    ): Promise<DesignerDispatchResult> {
+      const data = await fetchData<{ result: DesignerDispatchResult }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/commands`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(envelope),
+        },
+      );
+      return data.result;
+    },
+
+    async linkDesignToCloud(
+      designId: string,
+      options?: {
+        existingCloudDesignId?: string;
+        lastSyncedRevision?: number;
+      },
+    ): Promise<{
+      link: { cloudDesignId: string; workspaceId: string; userId: string };
+    }> {
+      return fetchData<{
+        link: { cloudDesignId: string; workspaceId: string; userId: string };
+      }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/cloud-link`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(options ?? {}),
+        },
+      );
+    },
+
+    // Bypass cloud headers — used during import-from-cloud to seed local
+    // SQLite without triggering outbound mirror (the data already exists in
+    // the cloud, so re-mirroring would create duplicate entities).
+    async dispatchLocalOnly(
+      designId: string,
+      envelope: DesignerCommandEnvelope,
+    ): Promise<DesignerDispatchResult> {
+      const data = await fetchData<{ result: DesignerDispatchResult }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/commands`,
+        ),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(envelope),
+        },
+      );
+      return data.result;
+    },
+
+    async getCloudLink(designId: string): Promise<{
+      link: {
+        cloudDesignId: string;
+        workspaceId: string;
+        userId: string;
+        lastSyncedRevision: number;
+        linkedAt: string;
+        failedAttempts: number;
+        lastError: string | null;
+      } | null;
+    }> {
+      return fetchData(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/cloud-link`,
+        ),
+      );
+    },
+
+    async unlinkDesignFromCloud(designId: string): Promise<{ ok: boolean }> {
+      return fetchData<{ ok: boolean }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/cloud-link`,
+        ),
+        { method: "DELETE" },
+      );
+    },
+
+    async getHistory(
+      designId: string,
+      sessionId: string,
+    ): Promise<DesignerHistorySnapshot> {
+      const data = await fetchData<{ history: DesignerHistorySnapshot }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/history?sessionId=${encodeURIComponent(sessionId)}`,
+        ),
+      );
+      return data.history;
+    },
+
+    async undo(
+      designId: string,
+      sessionId: string,
+      expectedRevision: number,
+    ): Promise<DesignerHistoryActionResult> {
+      const data = await fetchData<{ result: DesignerHistoryActionResult }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/history/undo`,
+        ),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId, expectedRevision }),
+        },
+      );
+      return data.result;
+    },
+
+    async redo(
+      designId: string,
+      sessionId: string,
+      expectedRevision: number,
+    ): Promise<DesignerHistoryActionResult> {
+      const data = await fetchData<{ result: DesignerHistoryActionResult }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/history/redo`,
+        ),
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ sessionId, expectedRevision }),
+        },
+      );
+      return data.result;
+    },
+
+    async inspectKicadProject(file: File): Promise<KicadProjectInspectReport> {
+      const formData = new FormData();
+      formData.set("file", file, file.name);
+      const data = await fetchData<{ report: KicadProjectInspectReport }>(
+        buildModuleUrl(backendURL, moduleId, "/imports/kicad-project/inspect"),
+        { method: "POST", body: formData },
+      );
+      return data.report;
+    },
+
+    async commitKicadProject(
+      file: File,
+      designName?: string,
+    ): Promise<KicadProjectCommitResult> {
+      const formData = new FormData();
+      formData.set("file", file, file.name);
+      if (designName) formData.set("designName", designName);
+      const data = await fetchData<{ result: KicadProjectCommitResult }>(
+        buildModuleUrl(backendURL, moduleId, "/imports/kicad-project"),
+        { method: "POST", body: formData },
+      );
+      return data.result;
+    },
+
+    async downloadGerberZip(
+      designId: string,
+      options?: {
+        includeBom?: boolean;
+        includePickAndPlace?: boolean;
+        includeInnerLayers?: boolean;
+      },
+    ): Promise<{ bundleName: string; warnings: number; blob: Blob }> {
+      const url = `${buildModuleUrl(
+        backendURL,
+        moduleId,
+        `/designs/${encodeURIComponent(designId)}/exports/gerber`,
+      )}?format=zip`;
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(options ?? {}),
+      });
+      if (!res.ok) {
+        const contentType = res.headers.get("content-type") ?? "";
+        if (contentType.includes("application/problem+json")) {
+          const problem = (await res.json()) as DesignerApiProblem;
+          throw new Error(
+            problem.detail ?? problem.title ?? `HTTP ${res.status}`,
+          );
+        }
+        throw new Error(`HTTP ${res.status}`);
+      }
+      // The X-OpenPCB-* response headers are *not* exposed by default
+      // cross-origin (no `Access-Control-Expose-Headers`), so always derive
+      // the bundle name client-side mirroring the backend sanitizer.
+      const bundleName = exportBundleName(designId);
+      const warnings = Number.parseInt(
+        res.headers.get("X-OpenPCB-Warnings") ?? "0",
+        10,
+      );
+      const blob = await res.blob();
+      return { bundleName, warnings, blob };
+    },
+
+    /**
+     * Lightweight export preview — builds the bundle server-side and returns
+     * the file list + preflight warnings (no file text). Used by the export
+     * dialog to surface warnings and the exact output set before download.
+     */
+    async fetchExportSummary(
+      designId: string,
+      options?: GerberExportRequestOptions,
+    ): Promise<ExportSummary> {
+      return fetchData<ExportSummary>(
+        `${buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/exports/gerber`,
+        )}?format=summary`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(options ?? {}),
+        },
+      );
+    },
+
+    async downloadBomArtifact(
+      designId: string,
+      kind: "csv" | "tsv" | "jlc" | "kicad" | "pnp",
+    ): Promise<void> {
+      const pathByKind = {
+        csv: "bom.csv",
+        tsv: "bom.tsv",
+        jlc: "bom-jlc.csv",
+        kicad: "kicad-bom.csv",
+        pnp: "pnp.csv",
+      } satisfies Record<typeof kind, string>;
+      const extension = kind === "tsv" ? "tsv" : "csv";
+      const res = await fetch(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/exports/${pathByKind[kind]}`,
+        ),
+      );
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      downloadBlob(
+        await res.blob(),
+        `${exportBundleName(designId)}-${kind}.${extension}`,
+      );
+    },
+
+    // ── Cloud auto-router ──────────────────────────────────────────────
+    /** Submit the board to the cloud auto-router. Returns the job id + warnings. */
+    async submitAutoroute(
+      designId: string,
+      request?: {
+        options?: RouteOptions;
+        routableNetClassIds?: string[];
+        excludedNetIds?: string[];
+        serializePours?: boolean;
+      },
+    ): Promise<SubmitRouteResponse & { warnings: string[] }> {
+      return fetchData<SubmitRouteResponse & { warnings: string[] }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoroute`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(request ?? {}),
+        },
+      );
+    },
+
+    /** Poll a routing job's status + (on completion) its RouteResultEnvelope. */
+    async getAutorouteStatus(
+      designId: string,
+      jobId: string,
+    ): Promise<RouteStatusResponse> {
+      return fetchData<RouteStatusResponse>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoroute/${encodeURIComponent(
+            jobId,
+          )}`,
+        ),
+        { headers: applyCloudHeaders(undefined) },
+      );
+    },
+
+    /** Apply the user's cherry-picked ops; returns the post-apply DRC report. */
+    async applyAutorouteOps(
+      designId: string,
+      operations: RouteOperation[],
+      sessionId: string,
+      // Dataset-capture attribution (WP-D4): job/candidate identity + the
+      // otherwise-dropped RoutePayloadSummary, persisted server-side.
+      captureFields?: {
+        jobId?: string;
+        appliedCandidateId?: string;
+        resultSummary?: unknown;
+      },
+    ): Promise<{
+      appliedCount: number;
+      failures: Array<{ opId: string; code: string }>;
+      drc: DrcReport | null;
+    }> {
+      return fetchData<{
+        appliedCount: number;
+        failures: Array<{ opId: string; code: string }>;
+        drc: DrcReport | null;
+      }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoroute/apply`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ operations, sessionId, ...captureFields }),
+        },
+      );
+    },
+
+    // ── Cloud auto-place ───────────────────────────────────────────────
+    /** Submit the board to the cloud auto-place service. Returns the job id + warnings. */
+    async submitAutoplace(
+      designId: string,
+      request?: {
+        placeOptions?: PlaceOptions;
+        routableNetClassIds?: string[];
+        excludedNetIds?: string[];
+      },
+    ): Promise<SubmitPlaceResponse & { warnings: string[] }> {
+      return fetchData<SubmitPlaceResponse & { warnings: string[] }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoplace`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify(request ?? {}),
+        },
+      );
+    },
+
+    /** Poll a placement job's status + (on completion) its PlacementResultEnvelope. */
+    async getAutoplaceStatus(
+      designId: string,
+      jobId: string,
+    ): Promise<PlaceStatusResponse> {
+      return fetchData<PlaceStatusResponse>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoplace/${encodeURIComponent(
+            jobId,
+          )}`,
+        ),
+        { headers: applyCloudHeaders(undefined) },
+      );
+    },
+
+    /** Apply the user's cherry-picked placement ops; returns the post-apply DRC report. */
+    async applyAutoplaceOps(
+      designId: string,
+      operations: PlaceOperation[],
+      sessionId: string,
+      captureFields?: { jobId?: string; appliedCandidateId?: string },
+    ): Promise<{
+      appliedCount: number;
+      failures: Array<{ opId: string; code: string }>;
+      drc: DrcReport | null;
+    }> {
+      return fetchData<{
+        appliedCount: number;
+        failures: Array<{ opId: string; code: string }>;
+        drc: DrcReport | null;
+      }>(
+        buildModuleUrl(
+          backendURL,
+          moduleId,
+          `/designs/${encodeURIComponent(designId)}/autoplace/apply`,
+        ),
+        {
+          method: "POST",
+          headers: applyCloudHeaders({ "content-type": "application/json" }),
+          body: JSON.stringify({ operations, sessionId, ...captureFields }),
+        },
+      );
+    },
+  };
+}

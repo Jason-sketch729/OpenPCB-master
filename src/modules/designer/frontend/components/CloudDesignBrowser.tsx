@@ -1,0 +1,368 @@
+import { useCallback, useEffect, useState, type ReactElement } from "react";
+import { useAuth } from "@/cloud/AuthProvider";
+import {
+  getCloudProjection,
+  listPersonalWorkspaceDesigns,
+  type CloudDesignSummary,
+  type CloudProjection,
+} from "@/cloud/queries";
+import { useDesignerTabsStore } from "../stores/designer-tabs-store";
+import type { createDesignerApi } from "../api";
+import { cloudNetIdentityImportError } from "./cloud-import-identity";
+
+type DesignerApi = ReturnType<typeof createDesignerApi>;
+
+interface CloudDesignBrowserProps {
+  open: boolean;
+  onClose: () => void;
+  api: Pick<
+    DesignerApi,
+    "createDesign" | "dispatchLocalOnly"
+  >;
+  onNotify: (
+    message: string,
+    variant?: "info" | "success" | "warning" | "error",
+  ) => void;
+}
+
+interface ProjectionView {
+  designId: string;
+  name: string;
+  revision: number;
+  projection: CloudProjection;
+}
+
+function newId(): string {
+  // crypto.randomUUID is available in modern browsers + Electron.
+  return crypto.randomUUID();
+}
+
+function cloudPinIntentImportError(projection: unknown): string | null {
+  if (typeof projection !== "object" || projection === null) return null;
+  const parts = (projection as Record<string, unknown>).parts;
+  if (!Array.isArray(parts)) return null;
+
+  for (const part of parts) {
+    if (typeof part !== "object" || part === null) continue;
+    const partRecord = part as Record<string, unknown>;
+    if (!("pins" in partRecord)) continue;
+    if (!Array.isArray(partRecord.pins)) {
+      return "Cloud import cannot inspect malformed pin data. No local design was created.";
+    }
+    for (const pin of partRecord.pins) {
+      if (typeof pin !== "object" || pin === null) {
+        return "Cloud import cannot inspect malformed pin data. No local design was created.";
+      }
+      const electricalIntent = (pin as Record<string, unknown>).electricalIntent;
+      if (electricalIntent !== null && electricalIntent !== undefined) {
+        return "Cloud import cannot preserve pin electrical intent yet. No local design was created.";
+      }
+    }
+  }
+  return null;
+}
+
+interface ImportSummary {
+  parts: number;
+  wires: number;
+  labels: number;
+  partsSkipped: string[]; // component IDs missing locally
+  wiresSkipped: number;
+}
+
+export function CloudDesignBrowser({
+  open,
+  onClose,
+  api,
+  onNotify,
+}: CloudDesignBrowserProps): ReactElement | null {
+  const { enabled, session } = useAuth();
+  const [designs, setDesigns] = useState<CloudDesignSummary[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [importing, setImporting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [view, setView] = useState<ProjectionView | null>(null);
+
+  const openTab = useDesignerTabsStore((s) => s.openTab);
+
+  const refresh = useCallback(async () => {
+    if (!enabled || !session) return;
+    setLoading(true);
+    setError(null);
+    try {
+      const rows = await listPersonalWorkspaceDesigns();
+      setDesigns(rows);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, [enabled, session]);
+
+  useEffect(() => {
+    if (open) void refresh();
+  }, [open, refresh]);
+
+  const onPreview = useCallback(async (d: CloudDesignSummary) => {
+    setLoading(true);
+    setError(null);
+    try {
+      const detail = await getCloudProjection(d.id);
+      setView({
+        designId: d.id,
+        name: detail.name,
+        revision: detail.revision,
+        projection: detail.projection,
+      });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const onImportToLocal = useCallback(
+    async (cloudDesign: ProjectionView) => {
+      setImporting(true);
+      setError(null);
+      try {
+        const pinIntentError = cloudPinIntentImportError(
+          cloudDesign.projection,
+        );
+        if (pinIntentError) throw new Error(pinIntentError);
+        const identityError = cloudNetIdentityImportError(cloudDesign.projection);
+        if (identityError) throw new Error(identityError);
+
+        // 1. Create new local design with the cloud's name.
+        const local = await api.createDesign(cloudDesign.name);
+
+        // This legacy replay is a new, unlinked copy. It cannot preserve the
+        // peer's entity identities, revision, or complete projection contents.
+        const projection = cloudDesign.projection;
+        const summary: ImportSummary = {
+          parts: 0,
+          wires: 0,
+          labels: 0,
+          partsSkipped: [],
+          wiresSkipped: 0,
+        };
+        let baseRev = 0;
+
+        const dispatchOrSkip = async (
+          command: { type: string; [k: string]: unknown },
+          skippableCodes: string[] = [],
+        ): Promise<{ ok: boolean; code?: string }> => {
+          const result = await api.dispatchLocalOnly(local.id, {
+            commandId: newId(),
+            sessionId: "cloud-import",
+            aggregateId: local.id,
+            baseRevision: baseRev,
+            issuedAt: Date.now(),
+            // DesignerCommand is a strict union; the import flow synthesizes
+            // commands from runtime cloud data so we need a one-shot cast.
+            command: command as unknown as Parameters<
+              typeof api.dispatchLocalOnly
+            >[1]["command"],
+          });
+          if (result.ok) {
+            baseRev += 1;
+            return { ok: true };
+          }
+          const code = (result as { code?: string }).code;
+          if (code && skippableCodes.includes(code)) {
+            return { ok: false, code };
+          }
+          throw new Error(
+            `Import dispatch failed for ${command.type} (rev ${baseRev}, code=${code ?? "unknown"})`,
+          );
+        };
+
+        // 3a. Parts first (wires depend on parts existing for pin lookup).
+        for (const part of projection.parts ?? []) {
+          const res = await dispatchOrSkip(
+            {
+              type: "place_part",
+              componentId: part.componentId,
+              positionNm: part.positionNm,
+              rotationDeg: part.rotationDeg,
+              mirrored: part.mirrored,
+            },
+            ["COMPONENT_NOT_FOUND"],
+          );
+          if (res.ok) summary.parts += 1;
+          else summary.partsSkipped.push(part.componentId);
+        }
+
+        // 3b. Wires (only those whose pin endpoints survived the part skip).
+        for (const wire of projection.wires ?? []) {
+          const res = await dispatchOrSkip(
+            {
+              type: "create_wire",
+              sourcePinId: wire.sourcePinId,
+              targetPinId: wire.targetPinId,
+              ...(wire.pointsNm ? { pointsNm: wire.pointsNm } : {}),
+            },
+            ["PIN_NOT_FOUND", "INVALID_WIRE_PATH"],
+          );
+          if (res.ok) summary.wires += 1;
+          else summary.wiresSkipped += 1;
+        }
+
+        // 3c. Labels (no labelId → local creates fresh).
+        for (const label of projection.labels ?? []) {
+          const res = await dispatchOrSkip(
+            {
+              type: "upsert_label",
+              text: label.text,
+              positionNm: label.positionNm,
+              confirmMerge: true,
+            },
+            ["INVALID_LABEL"],
+          );
+          if (res.ok) summary.labels += 1;
+        }
+
+        const skippedMsg = summary.partsSkipped.length
+          ? ` — ${summary.partsSkipped.length} parts skipped (missing components: ${[...new Set(summary.partsSkipped)].slice(0, 3).join(", ")}${summary.partsSkipped.length > 3 ? "…" : ""})`
+          : "";
+        const wiresMsg = summary.wiresSkipped
+          ? ` — ${summary.wiresSkipped} wires skipped`
+          : "";
+        onNotify(
+          `Imported unlinked copy of ${cloudDesign.name}: ${summary.parts} parts, ${summary.wires} wires, ${summary.labels} labels${skippedMsg}${wiresMsg}`,
+          summary.partsSkipped.length || summary.wiresSkipped
+            ? "warning"
+            : "success",
+        );
+        openTab(local.id);
+        onClose();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+        onNotify(
+          `Import failed: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+      } finally {
+        setImporting(false);
+      }
+    },
+    [api, onClose, onNotify, openTab],
+  );
+
+  if (!open) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6">
+      <div className="flex h-full max-h-[80vh] w-full max-w-3xl flex-col rounded-md bg-white shadow-xl dark:bg-slate-900">
+        <header className="flex items-center justify-between border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+          <h2 className="text-sm font-medium">
+            {view
+              ? `Cloud: ${view.name} (rev ${view.revision})`
+              : "Open from Cloud"}
+          </h2>
+          <button
+            type="button"
+            onClick={() => {
+              if (view) setView(null);
+              else onClose();
+            }}
+            className="rounded-sm px-2 py-1 text-xs hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            {view ? "Back" : "Close"}
+          </button>
+        </header>
+
+        {error && (
+          <div className="border-b border-red-300 bg-red-50 px-4 py-2 text-xs text-red-700 dark:border-red-900 dark:bg-red-950 dark:text-red-300">
+            {error}
+          </div>
+        )}
+
+        <div className="flex-1 overflow-auto p-4">
+          {loading && <div className="text-xs text-slate-500">Loading…</div>}
+
+          {!loading && !view && designs.length === 0 && (
+            <div className="text-xs text-slate-500">
+              No cloud designs in your personal workspace yet. Use “Link to
+              Cloud” on a local design first.
+            </div>
+          )}
+
+          {!loading && !view && designs.length > 0 && (
+            <ul className="space-y-2">
+              {designs.map((d) => (
+                <li
+                  key={d.id}
+                  className="flex items-center justify-between rounded-sm border border-slate-200 px-3 py-2 dark:border-slate-700"
+                >
+                  <div>
+                    <div className="text-sm">{d.name}</div>
+                    <div className="text-xs text-slate-500">
+                      rev {d.revision} · {d.id}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void onPreview(d)}
+                    className="rounded-sm border border-slate-300 px-2 py-0.5 text-xs hover:bg-slate-100 dark:border-slate-600 dark:hover:bg-slate-800"
+                  >
+                    Preview
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+
+          {!loading && view && (
+            <div className="space-y-4">
+              <ProjectionSummary projection={view.projection} />
+              <p className="text-xs text-text-secondary">
+                Creates a new, unlinked copy of parts, wires, and labels. Some data may be skipped.
+              </p>
+              <button
+                type="button"
+                onClick={() => void onImportToLocal(view)}
+                disabled={importing}
+                className="rounded-sm border border-slate-300 bg-slate-100 px-3 py-1 text-xs hover:bg-slate-200 disabled:opacity-50 dark:border-slate-600 dark:bg-slate-800 dark:hover:bg-slate-700"
+              >
+                {importing ? "Importing copy…" : "Import copy"}
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ProjectionSummary({
+  projection,
+}: {
+  projection: CloudProjection;
+}): ReactElement {
+  const partCount = (projection.parts ?? []).length;
+  const wireCount = (projection.wires ?? []).length;
+  const labels = projection.labels ?? [];
+  return (
+    <div className="space-y-3 text-xs">
+      <div className="rounded-sm bg-slate-50 px-3 py-2 dark:bg-slate-800">
+        <strong>Counts:</strong> {partCount} parts · {wireCount} wires ·{" "}
+        {labels.length} labels
+      </div>
+      {labels.length > 0 && (
+        <div>
+          <h3 className="mb-1 font-medium">Labels</h3>
+          <ul className="space-y-1">
+            {labels.map((l) => (
+              <li key={l.id} className="text-slate-600 dark:text-slate-300">
+                <code>{l.text}</code> at (
+                {(l.positionNm.x / 1_000_000).toFixed(2)} mm,{" "}
+                {(l.positionNm.y / 1_000_000).toFixed(2)} mm)
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
