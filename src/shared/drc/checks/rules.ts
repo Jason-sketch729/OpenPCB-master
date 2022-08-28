@@ -1,0 +1,94 @@
+import type { RuleProblem } from "../rule-resolver";
+import type { DrcContext } from "../drc-context";
+import type { DrcViolationDraft } from "../types";
+import type { PcbRuleReadDiagnostic } from "../../../sdks/designer";
+
+/**
+ * Rule-table validity (rule-semantics contract §2.1, §10). The resolver is the
+ * only thing that knows which stored rules it could not apply; this check just
+ * reports what it refused.
+ *
+ * `DRC_RULE_INVALID` is an error and non-overridable: the rule is excluded from
+ * resolution, and a dropped TIGHTENING rule is fail-open — silently passing a
+ * board because its strictest rule was malformed is the failure mode this
+ * exists to stop. `DRC_RULE_INEFFECTIVE` is a warning: the rule still resolves,
+ * just not with the number (or against the references) its author wrote.
+ *
+ * ONE violation per (code, rule id): a violation id hashes only its code and
+ * anchors, so several problems on one rule — or several rows fighting over one
+ * id — must share a message (in the resolver's array-then-reason order) rather
+ * than emit colliding ids.
+ *
+ * ELECTRICAL input (electrical contract 13 §2) is reported the same way, one
+ * row per malformed FIELD, keyed `netClass:<id>:<field>` /
+ * `designRules.electrical.<field>`: a non-finite voltage used to resolve to the
+ * 2.5 mm band and a zero temperature rise to a 0 mm width, so both were passes.
+ * The constituent each field feeds is absent for the run instead.
+ */
+export function checkRules(ctx: DrcContext): DrcViolationDraft[] {
+  return [
+    ...storedRuleDrafts(ctx.projection.ruleReadDiagnostics ?? []),
+    ...group(ctx.resolver.problems, "invalid").map(([id, problems]) => ({
+      code: "DRC_RULE_INVALID" as const,
+      message: `Rule "${labelOf(problems)}" cannot be applied: ${details(problems)}`,
+      anchors: [{ kind: "rule" as const, ruleId: id }],
+    })),
+    ...group(ctx.resolver.electricalProblems, "invalid").map(([id, problems]) => ({
+      code: "DRC_RULE_INVALID" as const,
+      message: `Electrical setting "${labelOf(problems)}" cannot be applied: ${details(problems)}`,
+      anchors: [{ kind: "rule" as const, ruleId: id }],
+    })),
+    ...group(ctx.resolver.problems, "ineffective").map(([id, problems]) => ({
+      code: "DRC_RULE_INEFFECTIVE" as const,
+      message: `Rule "${labelOf(problems)}" has no effect: ${details(problems)}`,
+      anchors: [{ kind: "rule" as const, ruleId: id }],
+    })),
+  ];
+}
+
+/** Group reader losses so multiple fields on one stored rule share one id. */
+function storedRuleDrafts(
+  diagnostics: readonly PcbRuleReadDiagnostic[],
+): DrcViolationDraft[] {
+  const byId = new Map<string, PcbRuleReadDiagnostic[]>();
+  for (const diagnostic of diagnostics) {
+    const namespace = diagnostic.path.split("[")[0]!;
+    const rowPath = diagnostic.path.match(/^[^[]+\[\d+\]/)?.[0]
+      ?? diagnostic.path;
+    const id = diagnostic.ruleId
+      ? `stored:${namespace}:${diagnostic.ruleId}`
+      : `stored:${rowPath}`;
+    const bucket = byId.get(id);
+    if (bucket) bucket.push(diagnostic);
+    else byId.set(id, [diagnostic]);
+  }
+  return [...byId].map(([ruleId, rows]) => ({
+    code: "DRC_RULE_INVALID",
+    message: `Stored board settings cannot be fully applied: ${rows.map((row) => `${row.path} (${row.reason}): ${row.message}`).join("; ")}`,
+    anchors: [{ kind: "rule", ruleId }],
+  }));
+}
+
+/** Problems of one kind, bucketed by rule id, in first-seen order. */
+function group(
+  problems: readonly RuleProblem[],
+  kind: RuleProblem["kind"],
+): Array<[string, RuleProblem[]]> {
+  const byId = new Map<string, RuleProblem[]>();
+  for (const p of problems) {
+    if (p.kind !== kind) continue;
+    const bucket = byId.get(p.ruleId);
+    if (bucket) bucket.push(p);
+    else byId.set(p.ruleId, [p]);
+  }
+  return [...byId.entries()];
+}
+
+function labelOf(problems: readonly RuleProblem[]): string {
+  const first = problems[0]!;
+  return first.ruleName || first.ruleId;
+}
+
+function details(problems: readonly RuleProblem[]): string {
+  return problems.map((p) => p.detail).join("; ");
+}

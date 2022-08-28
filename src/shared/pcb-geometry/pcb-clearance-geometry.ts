@@ -1,0 +1,279 @@
+// Clearance-distance primitives for DRC. Pure functions, mm units.
+//
+// Clearance is a *minimum-distance predicate*, so exact-polygon clearance needs
+// only segment/point-to-polygon distance — NOT polygon boolean ops. Every
+// primitive returns 0 on overlap/containment so a caller can compute
+//   gap = dist(A, B) - (halfA + halfB)
+// and treat `gap <= 0` as a short and `gap < required` as a clearance breach.
+//
+// Built on the shared segment primitives in pcb-trace-geometry.ts (no
+// duplication, no external geometry dependency).
+
+import {
+  type Point,
+  projectPointToSegment,
+  segmentClosestPoints,
+  segmentToSegmentDistance,
+} from "./pcb-trace-geometry";
+
+/** Ray-cast point-in-polygon for a closed ring (last point implicitly closes). */
+export function pointInPolygon(point: Point, ring: readonly Point[]): boolean {
+  if (ring.length < 3) return false;
+  let inside = false;
+  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+    const a = ring[i]!;
+    const b = ring[j]!;
+    const straddles = a.y > point.y !== b.y > point.y;
+    if (
+      straddles &&
+      point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/**
+ * The crossing parity of {@link pointInPolygon} evaluated over a SUBSET of a
+ * ring's edges — the row band of `point.y` (broad-phase contract 08 §2.2).
+ * Only straddling edges contribute and the toggle is a commutative XOR, so any
+ * superset of the straddling set in any order gives the same boolean (§1 L3).
+ *
+ * OPERAND ORDER IS LOAD-BEARING (Astra A1 #3): the ring loop above walks
+ * `a = ring[i]`, `b = ring[i - 1]` — the LATER vertex is `a` — while a
+ * `RegionEdge` stores `(a, b) = (ring[k], ring[k + 1])`. The crossing
+ * expression is symmetric in a and b mathematically but NOT bit for bit, and a
+ * point a few 1e-7 mm from an edge can flip the parity, so the operands are
+ * swapped back here to reproduce the ring loop's exact float.
+ */
+export function pointInPolygonEdges(
+  point: Point,
+  edges: readonly { a: Point; b: Point }[],
+): boolean {
+  let inside = false;
+  for (const e of edges) {
+    const a = e.b;
+    const b = e.a;
+    const straddles = a.y > point.y !== b.y > point.y;
+    if (
+      straddles &&
+      point.x < ((b.x - a.x) * (point.y - a.y)) / (b.y - a.y) + a.x
+    ) {
+      inside = !inside;
+    }
+  }
+  return inside;
+}
+
+/** Minimum distance from a point to a closed polygon ring. 0 if inside. */
+export function pointToPolygonDistance(
+  point: Point,
+  ring: readonly Point[],
+): number {
+  if (ring.length < 2) return Infinity;
+  if (pointInPolygon(point, ring)) return 0;
+  let best = Infinity;
+  for (let i = 0; i < ring.length; i += 1) {
+    const a = ring[i]!;
+    const b = ring[(i + 1) % ring.length]!;
+    const d = projectPointToSegment(point, a, b).distance;
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Minimum distance from segment AB to a closed polygon ring. 0 on overlap. */
+export function segmentToPolygonDistance(
+  a: Point,
+  b: Point,
+  ring: readonly Point[],
+): number {
+  if (ring.length < 2) return Infinity;
+  // Either endpoint inside the polygon → overlap.
+  if (pointInPolygon(a, ring) || pointInPolygon(b, ring)) return 0;
+  let best = Infinity;
+  for (let i = 0; i < ring.length; i += 1) {
+    const c = ring[i]!;
+    const d = ring[(i + 1) % ring.length]!;
+    const dist = segmentToSegmentDistance(a, b, c, d);
+    if (dist < best) best = dist;
+    if (best === 0) return 0;
+  }
+  return best;
+}
+
+/** Minimum distance from a polyline to a closed polygon ring. 0 on overlap. */
+export function polylineToPolygonDistance(
+  polyline: readonly Point[],
+  ring: readonly Point[],
+): number {
+  if (polyline.length < 2 || ring.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 1; i < polyline.length; i += 1) {
+    const d = segmentToPolygonDistance(polyline[i - 1]!, polyline[i]!, ring);
+    if (d < best) best = d;
+    if (best === 0) return 0;
+  }
+  return best;
+}
+
+/**
+ * Like {@link segmentToPolygonDistance}, but also reports where the minimum is
+ * attained: `onSegment` on AB, `onRing` on the ring. Overlap (a crossing, or an
+ * endpoint inside the filled polygon) is distance 0, exactly as the distance
+ * form returns 0 — the two points then describe the contact, not a separation.
+ *
+ * S6 rule semantics §4.4 uses it for trace↔pad and trace↔via once a trace has
+ * been split into sub-segments of constant area membership.
+ */
+export function segmentToRingClosestPoints(
+  a: Point,
+  b: Point,
+  ring: readonly Point[],
+): { distance: number; onSegment: Point; onRing: Point } {
+  if (ring.length < 2) return { distance: Infinity, onSegment: a, onRing: a };
+  let best = { distance: Infinity, onSegment: a, onRing: ring[0]! };
+  for (let i = 0; i < ring.length; i += 1) {
+    const c = ring[i]!;
+    const d = ring[(i + 1) % ring.length]!;
+    const cp = segmentClosestPoints(a, b, c, d);
+    if (cp.distance < best.distance) {
+      best = { distance: cp.distance, onSegment: cp.a, onRing: cp.b };
+    }
+    if (best.distance === 0) return best;
+  }
+  // The segment never met the perimeter, so containment is the only remaining
+  // overlap: a segment wholly inside the filled polygon is at distance 0.
+  if (pointInPolygon(a, ring) || pointInPolygon(b, ring)) {
+    return { distance: 0, onSegment: a, onRing: best.onRing };
+  }
+  return best;
+}
+
+/** Minimum edge-to-edge distance between two closed polygon rings. 0 on overlap. */
+export function polygonToPolygonDistance(
+  ringA: readonly Point[],
+  ringB: readonly Point[],
+): number {
+  if (ringA.length < 2 || ringB.length < 2) return Infinity;
+  // Containment either way → overlap.
+  if (pointInPolygon(ringA[0]!, ringB) || pointInPolygon(ringB[0]!, ringA)) {
+    return 0;
+  }
+  let best = Infinity;
+  for (let i = 0; i < ringA.length; i += 1) {
+    const a = ringA[i]!;
+    const b = ringA[(i + 1) % ringA.length]!;
+    const d = segmentToPolygonDistance(a, b, ringB);
+    if (d < best) best = d;
+    if (best === 0) return 0;
+  }
+  return best;
+}
+
+/**
+ * Minimum distance from a circle (center + radius) to a polygon ring. Negative
+ * when the circle overlaps the polygon (clamped at the center-to-ring distance
+ * minus the radius). 0 exactly at tangency.
+ */
+export function circleToPolygonDistance(
+  center: Point,
+  radius: number,
+  ring: readonly Point[],
+): number {
+  return pointToPolygonDistance(center, ring) - radius;
+}
+
+// --- Distance to a ring's PERIMETER (edges), ignoring inside/outside. Used for
+// board-edge clearance, where copper sits *inside* the outline but we still
+// want its distance to the boundary (the filled-polygon helpers above return 0
+// when contained, which is wrong for edge clearance). ---
+
+/** Minimum distance from a point to the closed ring's edges. */
+export function pointToRingEdgeDistance(
+  p: Point,
+  ring: readonly Point[],
+): number {
+  if (ring.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 0; i < ring.length; i += 1) {
+    const a = ring[i]!;
+    const b = ring[(i + 1) % ring.length]!;
+    const d = projectPointToSegment(p, a, b).distance;
+    if (d < best) best = d;
+  }
+  return best;
+}
+
+/** Minimum distance from a polyline to the closed ring's edges. */
+export function polylineToRingEdgeDistance(
+  polyline: readonly Point[],
+  ring: readonly Point[],
+): number {
+  if (polyline.length < 2 || ring.length < 2) return Infinity;
+  let best = Infinity;
+  for (let s = 1; s < polyline.length; s += 1) {
+    for (let i = 0; i < ring.length; i += 1) {
+      const a = ring[i]!;
+      const b = ring[(i + 1) % ring.length]!;
+      const d = segmentToSegmentDistance(polyline[s - 1]!, polyline[s]!, a, b);
+      if (d < best) best = d;
+    }
+  }
+  return best;
+}
+
+/**
+ * {@link ringToRingEdgeDistance} plus WHERE the minimum is attained — the two
+ * closest points, one on each perimeter. The DFM copper-shape check needs the
+ * midpoint of those points to mark a neck (contract 11 §5.3); the distance
+ * alone cannot say where two eroded cores nearly touch.
+ *
+ * `onA` / `onB` default to the rings' first vertices so the result is total for
+ * a degenerate input, exactly as the distance form returns `Infinity`.
+ */
+export function ringToRingClosestPoints(
+  ringA: readonly Point[],
+  ringB: readonly Point[],
+): { distance: number; onA: Point; onB: Point } {
+  const fallbackA = ringA[0] ?? { x: 0, y: 0 };
+  const fallbackB = ringB[0] ?? { x: 0, y: 0 };
+  if (ringA.length < 2 || ringB.length < 2) {
+    return { distance: Infinity, onA: fallbackA, onB: fallbackB };
+  }
+  let best = { distance: Infinity, onA: fallbackA, onB: fallbackB };
+  for (let i = 0; i < ringA.length; i += 1) {
+    const a = ringA[i]!;
+    const b = ringA[(i + 1) % ringA.length]!;
+    for (let j = 0; j < ringB.length; j += 1) {
+      const c = ringB[j]!;
+      const d = ringB[(j + 1) % ringB.length]!;
+      const cp = segmentClosestPoints(a, b, c, d);
+      if (cp.distance < best.distance) {
+        best = { distance: cp.distance, onA: cp.a, onB: cp.b };
+      }
+    }
+  }
+  return best;
+}
+
+/** Minimum edge-to-edge distance between two closed rings' perimeters. */
+export function ringToRingEdgeDistance(
+  ringA: readonly Point[],
+  ringB: readonly Point[],
+): number {
+  if (ringA.length < 2 || ringB.length < 2) return Infinity;
+  let best = Infinity;
+  for (let i = 0; i < ringA.length; i += 1) {
+    const a = ringA[i]!;
+    const b = ringA[(i + 1) % ringA.length]!;
+    for (let j = 0; j < ringB.length; j += 1) {
+      const c = ringB[j]!;
+      const d = ringB[(j + 1) % ringB.length]!;
+      const dist = segmentToSegmentDistance(a, b, c, d);
+      if (dist < best) best = dist;
+    }
+  }
+  return best;
+}
